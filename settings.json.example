@@ -1,0 +1,9 @@
+{
+    "MODEL_DIR": "./models",
+    "OUTPUT_DIR": "./LRC",
+    "MODEL_SIZE": "large-v2",
+    "LANGUAGE": "ja",
+    "PROMPT": "这是一首日语歌曲，包含汉字和假名，有长音。",
+    "OFFSET": 0,
+    "RELEASE_VRAM": true
+}
