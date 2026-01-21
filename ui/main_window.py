@@ -101,8 +101,11 @@ class LyricsGenApp(QMainWindow):
             raw = ""
             for enc in ['utf-8', 'gbk', 'utf-8-sig', 'big5']:
                 try:
-                    with open(f, 'r', encoding=enc) as file: raw = file.read(); break
-                except: continue
+                    with open(f, 'r', encoding=enc) as file:
+                        raw = file.read()
+                        break
+                except (UnicodeDecodeError, IOError):
+                    continue
             
             self.raw_lrc_content = raw 
             ext = os.path.splitext(f)[1].lower()
@@ -283,7 +286,9 @@ class LyricsGenApp(QMainWindow):
                             val = int(msg.split(":")[1])
                             self.pbar.setRange(0, 100)
                             self.pbar.setValue(val)
-                        except: pass
+                        except (ValueError, IndexError) as e:
+                            # Malformed progress message, ignore
+                            pass
                     else:
                         self.status.setText(msg)
             except Empty: break
@@ -391,11 +396,15 @@ class LyricsGenApp(QMainWindow):
         
         # 清空队列中可能残留的旧消息
         while not self.result_queue.empty():
-            try: self.result_queue.get_nowait()
-            except: pass
+            try:
+                self.result_queue.get_nowait()
+            except Empty:
+                pass
         while not self.progress_queue.empty():
-            try: self.progress_queue.get_nowait()
-            except: pass
+            try:
+                self.progress_queue.get_nowait()
+            except Empty:
+                pass
         
         args = WorkerArgs(
             audio_path=self.audio_path,

@@ -54,12 +54,17 @@ def clear_vram(model, force=True):
     global _cached_model, _cached_model_size
     if not force:
         return
-    
+
+    logger = setup_logger("Worker")
     try:
         if model:
-            if hasattr(model, 'to'): model.to("cpu")
+            if hasattr(model, 'to'):
+                model.to("cpu")
             del model
-    except: pass
+    except (AttributeError, RuntimeError) as e:
+        logger.debug(f"Expected error during VRAM cleanup: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error during VRAM cleanup: {e}")
     
     _cached_model = None
     _cached_model_size = None

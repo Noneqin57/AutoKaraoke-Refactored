@@ -24,8 +24,7 @@ logs/
 # Models and data
 models/
 
-# Configuration files
-config.py
+# User-specific configuration files (not config.py - that's source code)
 settings.json
 
 # Temporary files

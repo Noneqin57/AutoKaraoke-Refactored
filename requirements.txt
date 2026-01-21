@@ -4,7 +4,4 @@ torchaudio>=2.0.0
 stable-ts>=2.1.0
 openai-whisper>=20231117
 faster-whisper>=0.10.0
-openai>=1.0.0
-google-cloud-speech>=2.19.0
-azure-cognitiveservices-speech>=1.31.0
 requests>=2.28.0

@@ -14,7 +14,8 @@ def parse_time_tag(tag: str) -> int:
         clean = tag.strip("[]")
         parts = clean.split(':')
         return int((int(parts[0]) * 60 + float(parts[1])) * 1000)
-    except:
+    except (ValueError, IndexError, AttributeError):
+        # Malformed time tag format
         return -1
 
 def format_time(seconds: float, time_offset: float = 0) -> str:

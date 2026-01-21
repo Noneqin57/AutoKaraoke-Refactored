@@ -337,8 +337,11 @@ class LrcAligner:
         lines = []
         segments = self._get_attr(result, 'segments', [])
         if not segments:
-            try: segments = list(result)
-            except: pass
+            try:
+                segments = list(result)
+            except (TypeError, AttributeError) as e:
+                logger.debug(f"Could not convert result to list: {e}")
+                segments = []
         for seg in segments:
             if stop_event.is_set(): return ""
             start = self._get_attr(seg, 'start', 0)
@@ -367,8 +370,11 @@ class LrcAligner:
         self.ai_segments_pool = []
         segments = self._get_attr(result, 'segments', [])
         if not segments:
-            try: segments = list(result)
-            except: pass
+            try:
+                segments = list(result)
+            except (TypeError, AttributeError) as e:
+                logger.debug(f"Could not convert result to list: {e}")
+                segments = []
             
         for seg in segments:
             self.ai_segments_pool.append(seg) # 保存句子级信息
