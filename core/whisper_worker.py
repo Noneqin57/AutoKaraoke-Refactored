@@ -46,37 +46,57 @@ def preprocess_cjk_spaces(text):
     spaced = re.sub(pattern, r' \1 ', text)
     return re.sub(r'\s+', ' ', spaced).strip()
 
-# 全局变量用于缓存模型（仅在子进程内有效）
-_cached_model = None
-_cached_model_size = None
-
-def clear_vram(model, force=True):
-    global _cached_model, _cached_model_size
-    if not force:
-        return
-
-    logger = setup_logger("Worker")
-    try:
-        if model:
-            if hasattr(model, 'to'):
-                model.to("cpu")
-            del model
-    except (AttributeError, RuntimeError) as e:
-        logger.debug(f"Expected error during VRAM cleanup: {e}")
-    except Exception as e:
-        logger.error(f"Unexpected error during VRAM cleanup: {e}")
+class ModelCache:
+    """模型缓存管理类，封装全局模型状态"""
     
-    _cached_model = None
-    _cached_model_size = None
+    def __init__(self):
+        self.model = None
+        self.model_size = None
+        self.logger = setup_logger("ModelCache")
     
-    gc.collect()
-    if torch.cuda.is_available(): torch.cuda.empty_cache()
+    def get(self):
+        """获取缓存的模型"""
+        return self.model, self.model_size
+    
+    def set(self, model, model_size):
+        """设置缓存的模型"""
+        self.model = model
+        self.model_size = model_size
+        self.logger.info(f"Model cached: {model_size}")
+    
+    def clear(self, force=True):
+        """清理显存并重置缓存"""
+        if not force:
+            return
+        
+        try:
+            if self.model:
+                if hasattr(self.model, 'to'):
+                    self.model.to("cpu")
+                del self.model
+        except (AttributeError, RuntimeError) as e:
+            self.logger.debug(f"Expected error during VRAM cleanup: {e}")
+        except Exception as e:
+            self.logger.error(f"Unexpected error during VRAM cleanup: {e}")
+        
+        self.model = None
+        self.model_size = None
+        
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    def is_cached(self, model_size):
+        """检查指定模型是否已缓存"""
+        return self.model is not None and self.model_size == model_size
+
+
+# 全局模型缓存实例
+_model_cache = ModelCache()
 
 def daemon_worker(input_queue: Queue, result_queue: Queue, progress_queue: Queue, stop_event: Event):
-    """
-    常驻后台的工作进程，监听任务队列并执行
-    """
-    global _cached_model, _cached_model_size
+    """常驻后台的工作进程，监听任务队列并执行"""
+    global _model_cache
     
     # 初始化日志
     logger = setup_logger("WorkerDaemon")
@@ -88,16 +108,17 @@ def daemon_worker(input_queue: Queue, result_queue: Queue, progress_queue: Queue
             
             if task == "EXIT":
                 logger.info("Received EXIT signal. Shutting down daemon.")
+                _model_cache.clear(force=True)
                 break
                 
             if isinstance(task, WorkerArgs):
                 logger.info("Received new task.")
-                # 重置 stop_event
                 stop_event.clear()
+                
                 # 执行任务
                 run_inference_task(task, result_queue, progress_queue, stop_event)
                 
-                # 任务结束后，主动进行一次轻量级 GC，但保留模型
+                # 任务结束后进行轻量级清理，但保留模型
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
@@ -109,15 +130,12 @@ def daemon_worker(input_queue: Queue, result_queue: Queue, progress_queue: Queue
             time.sleep(1)
 
 def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Queue, stop_event: Event):
-    """
-    执行单次推理任务 (原 worker_process 逻辑)
-    """
-    global _cached_model, _cached_model_size
+    """执行单次推理任务"""
+    global _model_cache
     
-    # 初始化日志 (每次任务可能需要更新上下文，或者直接使用 global logger)
     logger = setup_logger("Worker")
     
-    # Unpack args
+    # 解包参数
     audio_path = args.audio_path
     model_size = args.model_size
     language = args.language
@@ -131,20 +149,20 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
     try:
         logger.info(f"Worker started. Audio: {audio_path}, Model: {model_size}")
         
+        # 恢复解析器状态
         parser = LrcParser()
         parser.headers = lrc_parser_data.get('headers', [])
         parser.lines_text = lrc_parser_data.get('lines_text', [])
         parser.translations = lrc_parser_data.get('translations', {})
-        parser.lines_timestamps = args.lrc_timestamps # 恢复时间戳信息
+        parser.lines_timestamps = args.lrc_timestamps
         
         local_model_path = model_dir
         os.makedirs(local_model_path, exist_ok=True)
         
-        # 记录传入的时间戳信息
+        # 记录时间戳信息
         if parser.lines_timestamps:
             valid_ts_count = sum(1 for t in parser.lines_timestamps if t > 0)
             logger.info(f"Received timestamps for {valid_ts_count} lines out of {len(parser.lines_timestamps)}")
-            # Log first 5 valid timestamps for debugging
             first_few = [t for t in parser.lines_timestamps if t > 0][:5]
             if first_few:
                 logger.info(f"First 5 valid timestamps: {first_few}")
@@ -158,19 +176,17 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
 
         model = None
         
-        # 尝试使用缓存模型
-        if _cached_model:
-            if _cached_model_size == model_size:
-                logger.info("Using cached model.")
-                model = _cached_model
-                progress_queue.put(f"⚡ 使用缓存模型 ({model_size})")
-            else:
-                logger.info(f"Model mismatch (cached: {_cached_model_size}, req: {model_size}). Clearing cache.")
+        # 使用模型缓存管理器
+        if _model_cache.is_cached(model_size):
+            logger.info("Using cached model.")
+            model, _ = _model_cache.get()
+            progress_queue.put(f"⚡ 使用缓存模型 ({model_size})")
+        else:
+            cached_model, cached_size = _model_cache.get()
+            if cached_model:
+                logger.info(f"Model mismatch (cached: {cached_size}, req: {model_size}). Clearing cache.")
                 progress_queue.put("🔄 切换模型中，释放旧模型显存...")
-                # 显式清理旧模型，防止双倍显存占用导致 OOM
-                clear_vram(_cached_model, force=True)
-                _cached_model = None
-                _cached_model_size = None
+                _model_cache.clear(force=True)
         
         # 加载新模型
         if not model:
@@ -196,8 +212,7 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
                 
                 # 更新缓存
                 if not release_vram_flag:
-                    _cached_model = model
-                    _cached_model_size = model_size
+                    _model_cache.set(model, model_size)
                     
             except Exception as e:
                 raise RuntimeError(f"模型加载失败: {str(e)}")
@@ -266,7 +281,7 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
     except torch.cuda.OutOfMemoryError:
         logger.error("OOM Error")
         result_queue.put(("error", "❌ 显存不足！请尝试更小的模型"))
-        clear_vram(model, force=True) # OOM 时强制清理
+        _model_cache.clear(force=True)
     except Exception as e:
         if not stop_event.is_set():
             logger.error(f"Error: {traceback.format_exc()}")
@@ -274,7 +289,4 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
     finally:
         # 根据设置决定是否释放显存
         if release_vram_flag:
-            clear_vram(model, force=True)
-        else:
-            # 如果保留显存，不做任何操作，让 _cached_model 保持引用
-            pass
+            _model_cache.clear(force=True)

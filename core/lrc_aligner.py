@@ -2,6 +2,7 @@
 import re
 from typing import List, Dict, Any, Optional
 from multiprocessing import Queue, Event
+from functools import lru_cache
 
 from config import MIN_DURATION
 from utils.time_utils import format_time
@@ -49,45 +50,16 @@ class LrcAligner:
             
         progress_queue.put("正在执行全局序列对齐...")
         
-        # 3. 准备用户输入的全局字符序列
-        user_char_sequence = [] # List[Dict]
-        for line_idx, line_text in enumerate(self.parser.lines_text):
-            tokens = self._tokenize_line(line_text)
-            for token in tokens:
-                token['line_idx'] = line_idx
-                user_char_sequence.append(token)
+        # 3. 准备用户输入的全局字符序列 (优化：预先计算)
+        user_char_sequence = self._prepare_user_sequence()
         logger.info(f"User char sequence length: {len(user_char_sequence)}")
         
-        # 4. 准备 AI 的全局字符序列
-        ai_char_sequence = []
-        for w_obj in self.ai_words_pool:
-            text = self._get_attr(w_obj, 'word', "")
-            start = self._get_attr(w_obj, 'start', 0.0)
-            end = self._get_attr(w_obj, 'end', 0.0) # 获取单词结束时间
-            # 简单清洗
-            clean_text = self._clean_token(text)
-            
-            # AI 的一个 word 可能包含多个字符 (特别是中文)
-            # 这里需要将 AI 的 word 也拆解成字符，以便与 user_sequence 进行细粒度对齐
-            # 简单起见，我们将单词的 start time 赋给第一个字符，后续字符时间线性插值
-            
-            if clean_text:
-                char_list = list(clean_text)
-                duration = end - start
-                char_duration = duration / len(char_list) if len(char_list) > 0 else 0
-                
-                for i, char in enumerate(char_list):
-                    char_time = start + (i * char_duration)
-                    ai_char_sequence.append({
-                        'text': char,
-                        'start': char_time,
-                        'orig_obj': w_obj
-                    })
+        # 4. 准备 AI 的全局字符序列 (优化：预先计算)
+        ai_char_sequence = self._prepare_ai_sequence()
         logger.info(f"AI char sequence length: {len(ai_char_sequence)}")
 
-        # 5. 使用 difflib 进行序列比对
-        # 构造用于比较的字符串列表
-        user_tokens_str = [self._clean_token(t['text']) for t in user_char_sequence]
+        # 5. 使用 difflib 进行序列比对 (优化：使用预清洗的字符串)
+        user_tokens_str = [t.get('clean_text', '') for t in user_char_sequence]
         ai_tokens_str = [t['text'] for t in ai_char_sequence]
         
         matcher = difflib.SequenceMatcher(None, user_tokens_str, ai_tokens_str)
@@ -348,8 +320,51 @@ class LrcAligner:
             text = self._get_attr(seg, 'text', '').strip()
             if text: lines.append(f"[{format_time(start, self.time_offset)}]{text}")
         return "\n".join(lines)
+    
+    def _prepare_user_sequence(self) -> List[Dict[str, Any]]:
+        """预处理用户字符序列，避免重复计算
+        
+        Returns:
+            用户字符序列列表
+        """
+        user_char_sequence = []
+        for line_idx, line_text in enumerate(self.parser.lines_text):
+            tokens = self._tokenize_line(line_text)
+            for token in tokens:
+                token['line_idx'] = line_idx
+                token['clean_text'] = self._clean_token(token['text'])
+                user_char_sequence.append(token)
+        return user_char_sequence
+    
+    def _prepare_ai_sequence(self) -> List[Dict[str, Any]]:
+        """预处理AI字符序列，避免重复计算
+        
+        Returns:
+            AI字符序列列表
+        """
+        ai_char_sequence = []
+        for w_obj in self.ai_words_pool:
+            text = self._get_attr(w_obj, 'word', "")
+            start = self._get_attr(w_obj, 'start', 0.0)
+            end = self._get_attr(w_obj, 'end', 0.0)
+            clean_text = self._clean_token(text)
+            
+            if clean_text:
+                char_list = list(clean_text)
+                duration = end - start
+                char_duration = duration / len(char_list) if len(char_list) > 0 else 0
+                
+                for i, char in enumerate(char_list):
+                    char_time = start + (i * char_duration)
+                    ai_char_sequence.append({
+                        'text': char,
+                        'start': char_time,
+                        'orig_obj': w_obj
+                    })
+        return ai_char_sequence
 
     def _tokenize_line(self, line):
+        """分词函数，将行文本拆分为token"""
         tokens = []
         token_iter = re.finditer(r'([a-zA-Z0-9\']+|[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff])', line)
         last_end_idx = 0
@@ -358,10 +373,10 @@ class LrcAligner:
             token_text = match.group()
             last_end_idx = match.end()
             tokens.append({
-                "text": token_text, 
-                "pre": pre_text, 
+                "text": token_text,
+                "pre": pre_text,
                 "time": None,
-                "end_idx": last_end_idx # Store for reconstruction
+                "end_idx": last_end_idx
             })
         return tokens
 
@@ -577,9 +592,22 @@ class LrcAligner:
 
     @staticmethod
     def _get_attr(obj, key, default=None):
-        if isinstance(obj, dict): return obj.get(key, default)
+        """安全获取对象属性或字典值"""
+        if isinstance(obj, dict):
+            return obj.get(key, default)
         return getattr(obj, key, default)
 
     @staticmethod
+    @lru_cache(maxsize=2048)
     def _clean_token(text):
+        """清理token文本，使用缓存优化性能
+        
+        Args:
+            text: 输入文本
+            
+        Returns:
+            清理后的小写文本
+        """
+        if not text:
+            return ""
         return re.sub(r'[^\w\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]', '', text).lower()

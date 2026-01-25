@@ -9,10 +9,24 @@ from PyQt6.QtCore import Qt
 
 from ui.main_window import LyricsGenApp
 
-if __name__ == "__main__":
+
+def main():
+    """应用程序主入口"""
     app = QApplication(sys.argv)
-    try: app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-    except: pass
+    
+    # 高DPI支持
+    try:
+        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
+        app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
+    except AttributeError:
+        pass
+    
+    # 创建并显示主窗口
     window = LyricsGenApp()
     window.show()
-    sys.exit(app.exec())
+    
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
