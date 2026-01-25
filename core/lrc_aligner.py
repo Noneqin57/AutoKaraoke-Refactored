@@ -24,7 +24,7 @@ class LrcAligner:
         self.ai_segments_pool: List[Dict[str, Any]] = [] # 新增：句子级 Segment
         self.pool_cursor = 0
         
-    def run(self, whisper_result: Any, stop_event: Event, progress_queue: Queue) -> str:
+    def run(self, whisper_result, stop_event: Event, progress_queue: Queue) -> str:
         """
         执行对齐主逻辑 (全局序列对齐版)
         """

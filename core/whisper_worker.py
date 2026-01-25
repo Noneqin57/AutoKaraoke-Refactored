@@ -94,7 +94,7 @@ class ModelCache:
 # 全局模型缓存实例
 _model_cache = ModelCache()
 
-def daemon_worker(input_queue: Queue, result_queue: Queue, progress_queue: Queue, stop_event: Event):
+def daemon_worker(input_queue, result_queue, progress_queue, stop_event):
     """常驻后台的工作进程，监听任务队列并执行"""
     global _model_cache
     
@@ -129,7 +129,7 @@ def daemon_worker(input_queue: Queue, result_queue: Queue, progress_queue: Queue
             import time
             time.sleep(1)
 
-def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Queue, stop_event: Event):
+def run_inference_task(args: WorkerArgs, result_queue, progress_queue, stop_event):
     """执行单次推理任务"""
     global _model_cache
     
