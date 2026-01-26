@@ -154,7 +154,8 @@ class LrcEditorDialog(QDialog):
                 # 检测翻译行（时间戳相同且不是第一次出现）
                 if timestamp == last_timestamp and row > 0:
                     self.translation_rows.add(row)
-                    # 移除图标标记，保持原始内容
+                    # 翻译行添加图标标记
+                    content = f"🌐 {content}"
                 
                 self.table.setItem(row, 0, QTableWidgetItem(timestamp))
                 self.table.setItem(row, 1, QTableWidgetItem(content))
@@ -544,8 +545,8 @@ class LrcEditorDialog(QDialog):
                 trans_time_item = self.table.item(row, 0)
                 trans_text_item = self.table.item(row, 1)
                 if trans_time_item and trans_text_item and trans_time_item.text() == original_timestamp:
-                    # 直接获取翻译内容（已移除图标标记）
-                    trans_text = trans_text_item.text()
+                    # 移除翻译标记图标
+                    trans_text = trans_text_item.text().replace("🌐 ", "")
                     translations.append(trans_text)
         
         # 渲染预览

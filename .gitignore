@@ -5,6 +5,7 @@ __pycache__/
 
 # Virtual environments
 .venv/
+packaging_env/
 venv/
 env/
 
@@ -30,3 +31,7 @@ settings.json
 # Temporary files
 *.tmp
 *.temp
+
+build/
+plan/
+LRC/
