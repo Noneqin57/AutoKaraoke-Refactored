@@ -35,6 +35,7 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
+**打包太大了了，建议还是用脚本打开**
 
 ## 📖 使用指南
 
