@@ -106,8 +106,8 @@ class ConfigManager:
                 if os.path.exists(temp_file):
                     try:
                         os.remove(temp_file)
-                    except:
-                        pass
+                    except OSError as cleanup_error:
+                        print(f"Failed to cleanup temp file: {cleanup_error}")
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取配置项
@@ -154,5 +154,6 @@ class ConfigManager:
             "OFFSET": 0,
             "RELEASE_VRAM": True,
             "MODEL_DIR": None,
-            "OUTPUT_DIR": None
+            "OUTPUT_DIR": None,
+            "HF_MIRROR": "https://hf-mirror.com"
         }

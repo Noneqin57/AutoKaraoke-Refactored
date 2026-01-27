@@ -15,6 +15,7 @@ from core.lrc_parser import LrcParser
 from core.whisper_worker import daemon_worker, WorkerArgs
 from ui.editor_dialog import LrcEditorDialog
 from ui.settings_dialog import SettingsDialog
+from ui.model_manager_dialog import ModelManagerDialog
 
 try:
     import faster_whisper
@@ -146,6 +147,10 @@ class LyricsGenApp(QMainWindow):
         adv_settings.triggered.connect(self.open_settings_dialog)
         settings_menu.addAction(adv_settings)
 
+        model_mgr = QAction("模型管理...", self)
+        model_mgr.triggered.connect(self.open_model_manager)
+        settings_menu.addAction(model_mgr)
+
     def setup_ui(self):
         self.setStyleSheet("""
             QMainWindow { background-color: #f5f7fa; }
@@ -271,6 +276,10 @@ class LyricsGenApp(QMainWindow):
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.config_manager, self)
+        dialog.exec()
+
+    def open_model_manager(self):
+        dialog = ModelManagerDialog(self)
         dialog.exec()
 
     def check_queue(self):

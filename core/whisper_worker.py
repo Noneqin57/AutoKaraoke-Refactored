@@ -196,10 +196,21 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
                     progress_queue.put(f"🚀 加载 Faster-Whisper ({model_size})...")
                     progress_queue.put("PROGRESS:10")
                     try:
-                        model = stable_whisper.load_faster_whisper(
-                            model_size, download_root=local_model_path, device=device,
-                            compute_type="float16" if device=="cuda" else "int8"
-                        )
+                        # 尝试使用本地下载的模型路径
+                        faster_whisper_path = os.path.join(local_model_path, f"faster-whisper-{model_size}")
+                        if os.path.exists(faster_whisper_path):
+                            logger.info(f"Loading from local path: {faster_whisper_path}")
+                            model = stable_whisper.load_faster_whisper(
+                                faster_whisper_path, device=device,
+                                compute_type="float16" if device=="cuda" else "int8"
+                            )
+                        else:
+                            # 回退到原始逻辑，让 stable_whisper 自动下载
+                            logger.info(f"Local model not found, falling back to auto-download")
+                            model = stable_whisper.load_faster_whisper(
+                                model_size, download_root=local_model_path, device=device,
+                                compute_type="float16" if device=="cuda" else "int8"
+                            )
                         use_faster = True
                     except Exception as fw_error:
                         logger.warning(f"Faster-Whisper load failed: {fw_error}")
