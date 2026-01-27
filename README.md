@@ -34,7 +34,6 @@ pip install -r requirements.txt
 ```bash
 python main.py
 ```
-程序将启动图形用户界面。
 
 ## 📖 使用指南
 
