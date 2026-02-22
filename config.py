@@ -88,26 +88,28 @@ class ConfigManager:
     def save(self):
         """保存配置到文件"""
         with self._lock:
-            try:
-                # 创建临时文件，避免写入失败导致配置丢失
-                temp_file = self.config_file + '.tmp'
-                with open(temp_file, 'w', encoding='utf-8') as f:
-                    json.dump(self.config, f, indent=4, ensure_ascii=False)
-                
-                # 原子性替换
-                if os.path.exists(self.config_file):
-                    os.replace(temp_file, self.config_file)
-                else:
-                    os.rename(temp_file, self.config_file)
-                    
-            except Exception as e:
-                print(f"Failed to save config: {e}")
-                # 清理临时文件
-                if os.path.exists(temp_file):
-                    try:
-                        os.remove(temp_file)
-                    except OSError as cleanup_error:
-                        print(f"Failed to cleanup temp file: {cleanup_error}")
+            self._save_unlocked()
+
+    def _save_unlocked(self):
+        """保存配置到文件（不获取锁，需由调用方持有锁）"""
+        try:
+            temp_file = self.config_file + '.tmp'
+            with open(temp_file, 'w', encoding='utf-8') as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+
+            if os.path.exists(self.config_file):
+                os.replace(temp_file, self.config_file)
+            else:
+                os.rename(temp_file, self.config_file)
+
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+            temp_file = self.config_file + '.tmp'
+            if os.path.exists(temp_file):
+                try:
+                    os.remove(temp_file)
+                except OSError as cleanup_error:
+                    print(f"Failed to cleanup temp file: {cleanup_error}")
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取配置项
@@ -134,12 +136,22 @@ class ConfigManager:
     
     def update(self, updates: dict):
         """批量更新配置
-        
+
         Args:
             updates: 配置字典
         """
         with self._lock:
             self.config.update(updates)
+
+    def update_and_save(self, updates: dict):
+        """原子性地更新并保存配置（单次锁内完成）
+
+        Args:
+            updates: 配置字典
+        """
+        with self._lock:
+            self.config.update(updates)
+            self._save_unlocked()
     
     def _get_default_config(self) -> dict:
         """获取默认配置
@@ -155,5 +167,9 @@ class ConfigManager:
             "RELEASE_VRAM": True,
             "MODEL_DIR": None,
             "OUTPUT_DIR": None,
-            "HF_MIRROR": "https://hf-mirror.com"
+            "HF_MIRROR": "https://hf-mirror.com",
+            "ENABLE_MSST": False,
+            "MSST_MODEL_KEY": "Kim_MelBandRoformer",
+            "MSST_MODEL_DIR": None,
+            "DISABLE_SSL_VERIFY": False
         }

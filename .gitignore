@@ -1,38 +1,50 @@
-# Python cache files
+# Python
 __pycache__/
-*.py[cod]
-*$py.class
-
-# Virtual environments
+*.pyc
+*.pyo
+*.pyd
 .venv/
-packaging_env/
 venv/
 env/
+*.egg-info/
+dist/
+build/
 
-# IDE files
-.idea/
+# IDE & Editor
 .vscode/
-.trae/
+.idea/
+*.swp
+*.swo
 
-# OS files
+# Configuration
+settings.json
+
+# Downloaded Models
+models/
+msst_models/
+
+# User Data & Logs
+歌词/
+*.log
+build_output.txt
+parser_report.txt
+parser_test_output.txt
+tsc_errors.txt
+docs/
+plan/
+tests/
+
+# Temporary Files
+*.tmp
+/reatk_uploads/
+
+# OS-specific
 .DS_Store
 Thumbs.db
 
-# Logs
-logs/
-*.log
-
-# Models and data
-models/
-
-# User-specific configuration files (not config.py - that's source code)
-settings.json
-
-# Temporary files
-*.tmp
-*.temp
-
-build/
-plan/
-LRC/
-LRC/カタオモイ - Aimer.lrc
+# Agent-related (based on file list)
+.agent/
+.agents/
+.claude/
+.continue/
+.trae/

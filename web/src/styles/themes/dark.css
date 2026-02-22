@@ -1,0 +1,55 @@
+/* === Spotify 风格深色主题 === */
+[data-theme="dark"] {
+    /* 背景 */
+    --color-bg: #121212;
+    --color-bg-secondary: #181818;
+    --color-bg-tertiary: #282828;
+    --color-bg-elevated: #1E1E1E;
+
+    /* 文字 */
+    --color-text: #FFFFFF;
+    --color-text-secondary: #B3B3B3;
+    --color-text-tertiary: #727272;
+    --color-text-inverse: #121212;
+
+    /* 强调色 */
+    --color-accent: #1DB954;
+    --color-accent-hover: #1ED760;
+    --color-accent-soft: rgba(29, 185, 84, 0.15);
+
+    /* 语义色 */
+    --color-success: #1DB954;
+    --color-warning: #FFB74D;
+    --color-error: #E74C3C;
+    --color-info: #64B5F6;
+
+    /* 边框 */
+    --color-border: #333333;
+    --color-border-light: #404040;
+
+    /* 组件 */
+    --color-card-bg: #181818;
+    --color-input-bg: #282828;
+    --color-input-border: #404040;
+    --color-input-focus: var(--color-accent);
+    --color-header-bg: rgba(18, 18, 18, 0.9);
+    --color-header-border: rgba(255, 255, 255, 0.08);
+
+    /* 按钮 */
+    --color-btn-primary: var(--color-accent);
+    --color-btn-primary-hover: var(--color-accent-hover);
+    --color-btn-secondary: #282828;
+    --color-btn-secondary-hover: #333333;
+    --color-btn-danger: #E74C3C;
+    --color-btn-danger-hover: #C0392B;
+
+    /* 进度条 */
+    --color-progress-bg: #333333;
+    --color-progress-fill: var(--color-accent);
+
+    /* 卡拉OK 预览 */
+    --color-karaoke-bg: #0A0A0A;
+    --color-karaoke-sung: #1DB954;
+    --color-karaoke-unsung: rgba(255, 255, 255, 0.4);
+    --color-karaoke-active: #1ED760;
+}

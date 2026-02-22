@@ -6,6 +6,8 @@ import threading
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Callable
 
+from utils.ssl_bypass import ssl_bypass_context
+
 # Try to import huggingface_hub for faster-whisper models
 try:
     from huggingface_hub import HfApi, hf_hub_download
@@ -49,12 +51,15 @@ ORIGINAL_WHISPER_MODELS = {
 }
 
 class ModelManager:
-    def __init__(self, base_dir: str):
+    """Whisper 模型管理器，负责列举、校验和删除模型"""
+
+    def __init__(self, base_dir: str) -> None:
         self.base_dir = base_dir
         if not os.path.exists(self.base_dir):
             os.makedirs(self.base_dir, exist_ok=True)
             
     def get_model_list(self) -> List[ModelInfo]:
+        """获取所有可用模型（含下载状态）的信息列表"""
         models = []
         
         # Faster Whisper Models
@@ -102,7 +107,8 @@ class ModelManager:
                 return False
         return True
 
-    def delete_model(self, model_info: ModelInfo):
+    def delete_model(self, model_info: ModelInfo) -> None:
+        """删除已下载的模型文件或目录"""
         if not model_info.is_downloaded:
             return
             
@@ -120,14 +126,21 @@ class ModelDownloader:
         self.model = model_info
         self.callback = progress_callback
         self.stop_flag = False
+        self.disable_ssl_verify = False
 
-    def set_mirror(self, mirror_url: Optional[str]):
+    def set_mirror(self, mirror_url: Optional[str]) -> None:
+        """设置 HuggingFace 镜像地址"""
         if mirror_url:
             self.mirror_url = mirror_url
             # Set environment variable for HF
             os.environ["HF_ENDPOINT"] = mirror_url
 
-    def start(self):
+    def set_ssl_verify(self, disable: bool) -> None:
+        """设置是否跳过 SSL 证书验证"""
+        self.disable_ssl_verify = disable
+
+    def start(self) -> None:
+        """开始下载模型，根据类型分派到 HF 或 URL 下载"""
         try:
             if self.model.type == ModelType.FASTER_WHISPER:
                 self._download_hf()
@@ -135,81 +148,95 @@ class ModelDownloader:
                 self._download_url()
         except Exception as e:
             if self.callback:
-                # If stopped manually, it might not be an error
                 if self.stop_flag:
                     self.callback(-1, "已暂停")
                 else:
                     self.callback(-1, f"Error: {str(e)}")
-            # Do not re-raise if we handle it via callback, but let the worker know
             raise e
 
-    def stop(self):
+    def stop(self) -> None:
+        """停止下载"""
         self.stop_flag = True
 
-    def _download_hf(self):
-        # Using huggingface_hub api to list files and download them one by one for progress
+    def _download_hf(self) -> None:
+        """通过 HuggingFace Hub 逐文件下载 Faster-Whisper 模型"""
         if not HAS_HF_HUB:
             raise ImportError("huggingface_hub not installed")
-            
-        api = HfApi(endpoint=os.environ.get("HF_ENDPOINT"))
-        repo_id = self.model.repo_id_or_url
-        target_dir = self.model.local_path
-        
-        os.makedirs(target_dir, exist_ok=True)
-        
-        if self.callback: self.callback(0, "Fetching file list...")
-        
-        # Get list of files
-        repo_files = api.list_repo_files(repo_id=repo_id)
-        # Filter out git/meta files
-        files_to_download = [f for f in repo_files if not f.startswith('.')]
-        
-        total_files = len(files_to_download)
-        
-        # Note: Proper size based progress is hard with snapshot_download without a custom tracker
-        # and listing all file sizes first is slow. We will use file count + per-file progress if possible
-        # Or just download file by file.
-        
-        for i, filename in enumerate(files_to_download):
-            if self.stop_flag: break
-            
-            if self.callback: 
-                self.callback(int((i / total_files) * 100), f"Downloading {filename}...")
-            
-            # Use requests to download for granular progress within file
-            # Get download URL
-            # Note: hf_hub_url gives us the url
-            # But wait, faster-whisper expects a specific directory structure.
-            # Using hf_hub_download is safer but lacks progress callback that is easy to hook.
-            # Let's try hf_hub_download with local_dir
-            
-            try:
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    local_dir=target_dir
-                )
-            except TypeError:
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    local_dir=target_dir,
-                    local_dir_use_symlinks=False
-                )
-            
-        if not self.stop_flag and self.callback:
-            self.callback(100, "Download Complete")
 
-    def _download_url(self):
+        with ssl_bypass_context(self.disable_ssl_verify):
+            api = HfApi(endpoint=os.environ.get("HF_ENDPOINT"))
+            repo_id = self.model.repo_id_or_url
+            target_dir = self.model.local_path
+            
+            # 使用临时缓存目录
+            temp_cache_dir = os.path.join(target_dir, ".hf_cache_temp")
+            os.makedirs(target_dir, exist_ok=True)
+            os.makedirs(temp_cache_dir, exist_ok=True)
+
+            if self.callback: self.callback(0, "Fetching file list...")
+
+            repo_files = api.list_repo_files(repo_id=repo_id)
+            files_to_download = [f for f in repo_files if not f.startswith('.')]
+
+            total_files = len(files_to_download)
+
+            for i, filename in enumerate(files_to_download):
+                if self.stop_flag: break
+
+                if self.callback:
+                    self.callback(int((i / total_files) * 100), f"Downloading {filename}...")
+
+                try:
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        local_dir=target_dir,
+                        cache_dir=temp_cache_dir,
+                        local_dir_use_symlinks=False
+                    )
+                except TypeError:
+                    hf_hub_download(
+                        repo_id=repo_id,
+                        filename=filename,
+                        local_dir=target_dir,
+                        # 某些旧版本可能不支持 cache_dir 或 local_dir_use_symlinks 组合
+                        local_dir_use_symlinks=False
+                    )
+
+            # 清理临时缓存
+            if os.path.exists(temp_cache_dir):
+                try:
+                    shutil.rmtree(temp_cache_dir)
+                except Exception as e:
+                    print(f"Failed to clean temp cache: {e}")
+
+            # 清理默认缓存目录 (models/models--Systran--faster-whisper-small)
+            try:
+                parent_dir = os.path.dirname(target_dir)
+                formatted_repo = repo_id.replace("/", "--")
+                default_cache_path = os.path.join(parent_dir, f"models--{formatted_repo}")
+                
+                if os.path.exists(default_cache_path) and os.path.isdir(default_cache_path):
+                     shutil.rmtree(default_cache_path)
+                     if self.callback: self.callback(99, "Cleaning up cache...")
+            except Exception as e:
+                print(f"Failed to clean default cache: {e}")
+
+            if not self.stop_flag and self.callback:
+                self.callback(100, "Download Complete")
+
+    def _download_url(self) -> None:
+        """通过 URL 流式下载 Original Whisper 模型"""
         url = self.model.repo_id_or_url
         dest = self.model.local_path
-        
+
         # Ensure dir
         os.makedirs(os.path.dirname(dest), exist_ok=True)
-        
+
         if self.callback: self.callback(0, "Connecting...")
-        
-        response = requests.get(url, stream=True, timeout=10)
+
+        verify_ssl = not self.disable_ssl_verify
+        response = requests.get(url, stream=True, timeout=10, verify=verify_ssl)
         total_size = int(response.headers.get('content-length', 0))
         
         if response.status_code != 200:
@@ -233,6 +260,7 @@ class ModelDownloader:
             # Cleanup partial
             try:
                 os.remove(dest)
-            except: pass
+            except OSError:
+                pass
         else:
             if self.callback: self.callback(100, "Download Complete")

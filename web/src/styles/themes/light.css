@@ -1,0 +1,55 @@
+/* === Apple Music 风格浅色主题 === */
+[data-theme="light"] {
+    /* 背景 */
+    --color-bg: #FFFFFF;
+    --color-bg-secondary: #F5F5F7;
+    --color-bg-tertiary: #EBEBED;
+    --color-bg-elevated: #FFFFFF;
+
+    /* 文字 */
+    --color-text: #1D1D1F;
+    --color-text-secondary: #6E6E73;
+    --color-text-tertiary: #AEAEB2;
+    --color-text-inverse: #FFFFFF;
+
+    /* 强调色 */
+    --color-accent: #FA586A;
+    --color-accent-hover: #E8495B;
+    --color-accent-soft: rgba(250, 88, 106, 0.1);
+
+    /* 语义色 */
+    --color-success: #34C759;
+    --color-warning: #FF9F0A;
+    --color-error: #FF3B30;
+    --color-info: #5AC8FA;
+
+    /* 边框 */
+    --color-border: #D2D2D7;
+    --color-border-light: #E5E5EA;
+
+    /* 组件 */
+    --color-card-bg: #FFFFFF;
+    --color-input-bg: #FFFFFF;
+    --color-input-border: #D2D2D7;
+    --color-input-focus: var(--color-accent);
+    --color-header-bg: rgba(255, 255, 255, 0.85);
+    --color-header-border: rgba(0, 0, 0, 0.1);
+
+    /* 按钮 */
+    --color-btn-primary: var(--color-accent);
+    --color-btn-primary-hover: var(--color-accent-hover);
+    --color-btn-secondary: #F5F5F7;
+    --color-btn-secondary-hover: #EBEBED;
+    --color-btn-danger: #FF3B30;
+    --color-btn-danger-hover: #E0342B;
+
+    /* 进度条 */
+    --color-progress-bg: #E5E5EA;
+    --color-progress-fill: var(--color-accent);
+
+    /* 卡拉OK 预览 */
+    --color-karaoke-bg: #1C1C1E;
+    --color-karaoke-sung: #34C759;
+    --color-karaoke-unsung: rgba(255, 255, 255, 0.5);
+    --color-karaoke-active: #4ADE80;
+}

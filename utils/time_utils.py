@@ -53,24 +53,30 @@ def parse_time_tag(tag: str) -> int:
         return -1
 
 
-@lru_cache(maxsize=1024)
+@lru_cache(maxsize=4096)
+def _format_time_cached(ms_int: int) -> str:
+    """内部缓存函数，接受毫秒整数避免浮点精度问题"""
+    final_ms = max(0, ms_int)
+    minutes = final_ms // 60000
+    secs = (final_ms % 60000) // 1000
+    milliseconds = final_ms % 1000
+    return f"{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+
+
 def format_time(seconds: float, time_offset: float = 0) -> str:
     """格式化秒数为 mm:ss.mmm，支持时间偏移
-    
-    此函数使用LRU缓存优化性能，避免重复计算相同的时间值。
-    
+
+    先将浮点数量化为毫秒整数再查缓存，避免浮点精度导致缓存命中率低。
+
     Args:
         seconds: 秒数
         time_offset: 时间偏移量（秒）
-        
+
     Returns:
         格式化的时间字符串 mm:ss.mmm
     """
-    final_sec = max(0.0, float(seconds) + float(time_offset))
-    minutes = int(final_sec // 60)
-    secs = int(final_sec % 60)
-    milliseconds = int((final_sec % 1) * 1000)
-    return f"{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+    ms_int = round((float(seconds) + float(time_offset)) * 1000)
+    return _format_time_cached(ms_int)
 
 
 def seconds_to_ms(seconds: float) -> int:

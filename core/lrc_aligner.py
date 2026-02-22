@@ -10,11 +10,46 @@ from utils.logger import setup_logger
 from core.lrc_parser import LrcParser
 
 import difflib
-import logging
 
 logger = setup_logger("Worker")
 
 class LrcAligner:
+    # === 对齐调参常量 ===
+    # 强制校准：无时间戳行的字间距估算 (秒/字)
+    FALLBACK_CHAR_INTERVAL: float = 0.25
+    # 强制校准触发阈值：偏差超过此值才校准 (秒)
+    FORCE_CALIBRATION_THRESHOLD: float = 1.5
+    # 行边界安全间隙 (秒)
+    LINE_BOUNDARY_GAP: float = 0.1
+    # 最终硬边界安全间隙 (秒)
+    HARD_BOUNDARY_GAP: float = 0.05
+    # 硬边界压缩：起始时间回退余量 (秒)
+    HARD_BOUNDARY_FALLBACK_DURATION: float = 0.2
+    # 硬边界压缩：最小持续时间 (秒)
+    HARD_BOUNDARY_MIN_DURATION: float = 0.1
+    # 平均分配：默认每字持续时间 (秒)
+    AVG_CHAR_DURATION: float = 0.3
+    # 平均分配：窄间距回退的每字持续时间 (秒)
+    AVG_CHAR_DURATION_NARROW: float = 0.25
+    # 平均分配：最小有效区间宽度 (秒)
+    AVG_MIN_INTERVAL: float = 0.2
+    # 平均分配：AI "慢唱"判定阈值 (秒/字)
+    AVG_SLOW_THRESHOLD: float = 0.5
+    # 平均分配：最小持续时间 (秒)
+    AVG_MIN_DURATION: float = 0.2
+    # 幻觉清洗：同行内两字间距阈值 (秒)
+    HALLUCINATION_GAP_THRESHOLD: float = 3.0
+    # 插值：右吸附触发间距阈值 (秒)
+    INTERPOLATION_LARGE_GAP: float = 2.5
+    # 插值：右吸附估算字持续时间 (秒)
+    INTERPOLATION_EST_CHAR_DURATION: float = 0.3
+    # 插值：右吸附最小前向间距 (秒)
+    INTERPOLATION_MIN_FORWARD_GAP: float = 0.1
+    # 插值：平滑插值最大步长 (秒)
+    INTERPOLATION_MAX_STEP: float = 0.4
+    # 插值：无后续锚点的左吸附步长 (秒)
+    INTERPOLATION_LEFT_ATTACH_STEP: float = 0.25
+
     def __init__(self, parser: LrcParser, time_offset: float = 0.0, enable_force_calibration: bool = True, enable_avg_distribution: bool = False):
         self.parser = parser
         self.time_offset = time_offset
@@ -25,287 +60,311 @@ class LrcAligner:
         self.pool_cursor = 0
         
     def run(self, whisper_result: Any, stop_event: Event, progress_queue: Queue) -> str:
-        """
-        执行对齐主逻辑 (全局序列对齐版)
-        """
+        """执行对齐主逻辑 (全局序列对齐版)"""
         logger.info("=== Starting LrcAligner Run ===")
         logger.info(f"Input lines count: {len(self.parser.lines_text)}")
         if self.parser.lines_timestamps:
             valid_ts_count = sum(1 for t in self.parser.lines_timestamps if t > 0)
             logger.info(f"Input lines with valid timestamps: {valid_ts_count}/{len(self.parser.lines_timestamps)}")
-        
-        output_lines = []
-        # 添加头部
-        for h in self.parser.headers: output_lines.append(h)
-        if self.parser.headers: output_lines.append("")
-        
-        # 1. 提取所有 AI 识别出的单词 (Flattened)
+
+        output_lines = list(self.parser.headers)
+        if self.parser.headers:
+            output_lines.append("")
+
+        # 1. 提取所有 AI 识别出的单词
         self._extract_words_from_result(whisper_result)
         logger.info(f"Extracted {len(self.ai_words_pool)} words from Whisper result.")
-        
+
         # 2. 如果没有参考文本，直接输出识别结果
         if not self.parser.lines_text:
             logger.info("No reference text provided. Generating raw LRC.")
             return self._generate_raw_lrc(whisper_result, stop_event)
-            
+
         progress_queue.put("正在执行全局序列对齐...")
-        
-        # 3. 准备用户输入的全局字符序列 (优化：预先计算)
+
+        # 3. 准备序列并执行全局对齐
         user_char_sequence = self._prepare_user_sequence()
-        logger.info(f"User char sequence length: {len(user_char_sequence)}")
-        
-        # 4. 准备 AI 的全局字符序列 (优化：预先计算)
         ai_char_sequence = self._prepare_ai_sequence()
+        logger.info(f"User char sequence length: {len(user_char_sequence)}")
         logger.info(f"AI char sequence length: {len(ai_char_sequence)}")
 
-        # 5. 使用 difflib 进行序列比对 (优化：使用预清洗的字符串)
+        self._backfill_timestamps_from_alignment(user_char_sequence, ai_char_sequence)
+
+        # 4. 按行分组并逐行处理
+        lines_tokens_map = self._group_tokens_by_line(user_char_sequence)
+        current_last_time = 0.0
+
+        for i in range(len(self.parser.lines_text)):
+            if stop_event.is_set():
+                return ""
+
+            line_tokens = lines_tokens_map[i]
+            target_line = self.parser.lines_text[i]
+
+            # 清洗、插值、校准
+            current_last_time = self._process_line_timestamps(i, line_tokens, current_last_time)
+
+            # 最终硬边界安全检查
+            current_last_time = self._enforce_hard_boundary(i, line_tokens, current_last_time)
+
+            # 生成结果行
+            line_str, effective_start = self._construct_line_string(line_tokens, target_line, 0.0)
+            output_lines.append(line_str)
+
+            # 处理翻译行
+            self._append_translation_lines(output_lines, i, effective_start, current_last_time)
+
+        return "\n".join(output_lines)
+
+    def _backfill_timestamps_from_alignment(
+        self,
+        user_char_sequence: List[Dict[str, Any]],
+        ai_char_sequence: List[Dict[str, Any]],
+    ) -> None:
+        """使用 difflib 序列比对回填时间戳"""
         user_tokens_str = [t.get('clean_text', '') for t in user_char_sequence]
         ai_tokens_str = [t['text'] for t in ai_char_sequence]
-        
-        matcher = difflib.SequenceMatcher(None, user_tokens_str, ai_tokens_str)
+
+        matcher = difflib.SequenceMatcher(None, user_tokens_str, ai_tokens_str, autojunk=False)
         logger.info(f"Sequence matching ratio: {matcher.ratio():.4f}")
-        
-        # 6. 回填时间戳
+
         last_valid_time = 0.0
-        
         match_stats = {'equal': 0, 'replace': 0, 'delete': 0, 'insert': 0}
+
         for tag, i1, i2, j1, j2 in matcher.get_opcodes():
             match_stats[tag] += (i2 - i1)
             if tag == 'equal':
-                # 匹配成功区间
                 for k in range(i2 - i1):
                     user_idx = i1 + k
                     ai_idx = j1 + k
-                    
                     matched_time = ai_char_sequence[ai_idx]['start']
-                    if matched_time < last_valid_time: matched_time = last_valid_time
-                    
+                    if matched_time < last_valid_time:
+                        matched_time = last_valid_time
                     user_char_sequence[user_idx]['time'] = matched_time
                     last_valid_time = matched_time
-            elif tag == 'replace':
-                # 替换区间 (尝试模糊匹配或者跳过)
-                pass
-            elif tag == 'delete':
-                # 用户有，AI 没有 (漏读) -> 插值处理
-                pass
-            elif tag == 'insert':
-                # AI 有，用户没有 (幻觉/多读) -> 忽略
-                pass
-        
+
         logger.info(f"Alignment stats: {match_stats}")
-        
-        # 7. 重新组装回行 (按行进行插值和格式化)
-        # 先按行分组
-        lines_tokens_map = {i: [] for i in range(len(self.parser.lines_text))}
+
+    def _group_tokens_by_line(self, user_char_sequence: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+        """按行索引分组 token"""
+        lines_tokens_map: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(len(self.parser.lines_text))}
         for token in user_char_sequence:
             lines_tokens_map[token['line_idx']].append(token)
-            
-        current_last_time = 0.0
-        
-        for i in range(len(self.parser.lines_text)):
-            if stop_event.is_set(): return ""
-            
-            line_tokens = lines_tokens_map[i]
-            target_line = self.parser.lines_text[i]
-            
-            # 幻觉清洗 (虽然全局对齐已经过滤了大部分，但仍需检查时序跳变)
-            self._clean_hallucinations(line_tokens)
-            
-            # 智能插值 (填补 'delete' 和 'replace' 造成的空洞)
-            self._interpolate_timestamps(line_tokens, current_last_time)
-            
-            # 更新 current_last_time
-            valid_times = [t['time'] for t in line_tokens if t['time'] is not None]
-            if valid_times:
-                current_last_time = valid_times[-1]
-            
-            # === 强制纠偏逻辑 (Force Calibration) ===
-            # 如果输入文件包含原始时间戳，我们强制将当前行的起始时间对齐到原始时间
-            original_ts = self.parser.lines_timestamps[i] if i < len(self.parser.lines_timestamps) else -1.0
-            
-            # 关键修正：只要有原始时间戳，无论当前行是否有生成时间，都强制应用
-            if self.enable_force_calibration and original_ts > 0:
-                is_force_calibrated = False
-                correction = 0.0
-                
-                if not valid_times:
-                    logger.warning(f"Line {i+1} [Original: {original_ts}s] has NO generated timestamp. Forcing fallback.")
-                    # 如果这一行完全没生成时间（漏读），直接把整个行的时间平移过来
-                    # 我们假设第一个字就是 original_ts，后面按节奏铺开
-                    base_time = original_ts
-                    for k, t in enumerate(line_tokens):
-                         t['time'] = base_time + (k * 0.25) # 估算节奏
+        return lines_tokens_map
+
+    def _get_next_line_start(self, line_idx: int) -> Optional[float]:
+        """获取下一行的有效起始时间戳"""
+        if line_idx + 1 < len(self.parser.lines_timestamps):
+            next_ts = self.parser.lines_timestamps[line_idx + 1]
+            if next_ts > 0:
+                return next_ts
+        return None
+
+    def _process_line_timestamps(
+        self,
+        line_idx: int,
+        line_tokens: List[Dict[str, Any]],
+        current_last_time: float,
+    ) -> float:
+        """处理单行的时间戳：清洗、插值、强制校准、平均分配
+
+        Returns:
+            更新后的 current_last_time
+        """
+        # 幻觉清洗
+        self._clean_hallucinations(line_tokens)
+        # 智能插值
+        self._interpolate_timestamps(line_tokens, current_last_time)
+
+        # 更新 current_last_time
+        valid_times = [t['time'] for t in line_tokens if t['time'] is not None]
+        if valid_times:
+            current_last_time = valid_times[-1]
+
+        # === 强制纠偏逻辑 (Force Calibration) ===
+        original_ts = self.parser.lines_timestamps[line_idx] if line_idx < len(self.parser.lines_timestamps) else -1.0
+
+        if not (self.enable_force_calibration and original_ts > 0):
+            return current_last_time
+
+        is_force_calibrated = False
+
+        if not valid_times:
+            logger.warning(f"Line {line_idx+1} [Original: {original_ts}s] has NO generated timestamp. Forcing fallback.")
+            base_time = original_ts
+            for k, t in enumerate(line_tokens):
+                 t['time'] = base_time + (k * self.FALLBACK_CHAR_INTERVAL)
+            current_last_time = line_tokens[-1]['time']
+            is_force_calibrated = True
+        else:
+            generated_start = valid_times[0]
+            diff = generated_start - original_ts
+            logger.info(f"Line {line_idx+1}: Orig={original_ts:.2f}s, Gen={generated_start:.2f}s, Diff={diff:.2f}s")
+
+            if abs(diff) > self.FORCE_CALIBRATION_THRESHOLD:
+                logger.warning(f"Line {line_idx+1} force calibrated! Diff: {diff:.2f}s")
+                correction = original_ts - generated_start
+                for t in line_tokens:
+                    if t['time'] is not None:
+                        t['time'] += correction
+                if line_tokens and line_tokens[-1]['time'] is not None:
                     current_last_time = line_tokens[-1]['time']
-                    is_force_calibrated = True
-                else:
-                    # 如果生成了时间，计算偏差
-                    generated_start = valid_times[0]
-                    diff = generated_start - original_ts
-                    
-                    logger.info(f"Line {i+1}: Orig={original_ts:.2f}s, Gen={generated_start:.2f}s, Diff={diff:.2f}s")
-                    
-                    # 降低阈值到 1.5秒，并且只要有偏差就修正
-                    if abs(diff) > 1.5:
-                        logger.warning(f"Line {i+1} force calibrated! Diff: {diff:.2f}s")
-                        correction = original_ts - generated_start
-                        for t in line_tokens:
-                            if t['time'] is not None:
-                                t['time'] += correction
-                        
-                        # 再次更新 current_last_time
-                        if line_tokens and line_tokens[-1]['time'] is not None:
-                            current_last_time = line_tokens[-1]['time']
-                        
-                        is_force_calibrated = True
+                is_force_calibrated = True
 
-                # === 强制边界检查 ===
-                # 无论是否触发了强制校准，只要有原始时间戳，我们就应该利用下一行的原始时间戳作为硬性约束
-                # 以防止本行的时间轴溢出到下一行
-                
-                next_line_start = None
-                if i + 1 < len(self.parser.lines_timestamps):
-                    next_ts = self.parser.lines_timestamps[i+1]
-                    if next_ts > 0: next_line_start = next_ts
+        # === 强制边界检查 ===
+        next_line_start = self._get_next_line_start(line_idx)
 
-                # 如果没有启用平均分配，我们至少要确保最后一个字不越界
-                if not self.enable_avg_distribution and next_line_start:
-                    last_token = line_tokens[-1]
-                    if last_token['time'] and last_token['time'] > next_line_start - 0.1:
-                         # 越界了，尝试整体压缩
-                         start_time = line_tokens[0]['time'] if line_tokens[0]['time'] else original_ts
-                         # 确保起始时间不晚于结束时间
-                         target_end = next_line_start - 0.1
-                         if target_end <= start_time: target_end = start_time + 0.1
-                         
-                         duration = target_end - start_time
-                         token_count = len(line_tokens)
-                         step = duration / token_count
-                         
-                         logger.warning(f"Line {i+1} overlap detected. Compressing to fit before {next_line_start}s")
-                         
-                         for k, t in enumerate(line_tokens):
-                             t['time'] = start_time + (k * step)
-                         
-                         if line_tokens:
-                             current_last_time = line_tokens[-1]['time']
-                             is_force_calibrated = True # 标记为已修改，虽然不是传统的平移校准
+        if not self.enable_avg_distribution and next_line_start:
+            last_token = line_tokens[-1]
+            if last_token['time'] and last_token['time'] > next_line_start - self.LINE_BOUNDARY_GAP:
+                 start_time = line_tokens[0]['time'] if line_tokens[0]['time'] else original_ts
+                 target_end = next_line_start - self.LINE_BOUNDARY_GAP
+                 if target_end <= start_time:
+                     target_end = start_time + self.LINE_BOUNDARY_GAP
 
-                # === 平均分配逻辑 (Average Distribution) ===
-                if is_force_calibrated and self.enable_avg_distribution:
-                    logger.info(f"Line {i+1} applying average distribution.")
-                    token_count = len(line_tokens)
-                    if token_count > 0:
-                        start_time = original_ts
-                        
-                        # 重新计算结束时间 (Target End Time)
-                        # 策略：既然触发了平均分配，说明我们不信任 AI 的内部时间结构
-                        # 我们优先使用“下一行的开始时间”作为当前行的界限，以填满空隙
-                        # 如果没有下一行时间，则使用字符数估算
-                        
-                        # 1. 尝试使用下一行的开始时间作为参考
-                        target_end = start_time + (token_count * 0.3) # Default fallback
-                        
-                        if next_line_start:
-                            # 留出 0.1s 间隙
-                            target_end_limit = next_line_start - 0.1
-                            
-                            # 如果计算出的持续时间太短（比如两句话重叠了），则回退到估算
-                            if target_end_limit - start_time < 0.2: 
-                                target_end = start_time + (token_count * 0.25)
-                            else:
-                                target_end = target_end_limit
-                        else:
-                            # 2. 没有下一行参考，直接根据字数估算 (0.3s 一个字，比较宽松)
-                            target_end = start_time + (token_count * 0.3)
-                            
-                        # 3. 检查 AI 原始生成的结束时间 (Shifted)
-                        # 如果 AI 生成的 duration 明显比我们估算的要长（说明唱得很慢），那保留 AI 的长度可能更好？
-                        # 但在“强制纠偏”场景下，通常意味着 AI 时间轴乱了，所以更倾向于规整化。
-                        # 这里我们只做一个最小长度检查：
-                        
-                        current_shifted_end = line_tokens[-1]['time']
-                        if current_shifted_end and (current_shifted_end - start_time) > (token_count * 0.5):
-                             # 如果 AI 认为这句话特别长（平均每字 > 0.5s），可能它是对的，取两者最大值
-                             # 但前提是不能超过 next_line_start
-                             potential_end = max(target_end, current_shifted_end)
-                             if next_line_start and potential_end > next_line_start - 0.1:
-                                 target_end = next_line_start - 0.1
-                             else:
-                                 target_end = potential_end
+                 duration = target_end - start_time
+                 token_count = len(line_tokens)
+                 step = duration / token_count
 
-                        duration = max(0.2, target_end - start_time)
-                        step = duration / token_count
-                        
-                        for k, t in enumerate(line_tokens):
-                            t['time'] = start_time + (k * step)
-                        
-                        if line_tokens:
-                            current_last_time = line_tokens[-1]['time']
-            
-            # === Final Hard Boundary Safety Check (Universal) ===
-            # 无论前面经过了什么处理 (AI生成/强制校准/平均分配)，最后一道防线确保不越界
-            if i + 1 < len(self.parser.lines_timestamps):
-                next_ts_limit = self.parser.lines_timestamps[i+1]
-                if next_ts_limit > 0:
-                    hard_limit = next_ts_limit - 0.05 # 留出 50ms 间隙
-                    
-                    # 寻找最后一个有效的时间戳 (防止末尾有 None)
-                    last_valid_idx = -1
-                    last_valid_time = None
-                    for k in range(len(line_tokens)-1, -1, -1):
-                        if line_tokens[k]['time'] is not None:
-                            last_valid_idx = k
-                            last_valid_time = line_tokens[k]['time']
-                            break
-                    
-                    if last_valid_idx != -1 and last_valid_time is not None:
-                         # 检查是否越界
-                         if last_valid_time > hard_limit:
-                             logger.warning(f"Line {i+1} final check: End={last_valid_time:.3f}s > Next={next_ts_limit:.3f}s. Compressing...")
-                             
-                             # 确定起始时间 (使用第一个有效时间)
-                             start_valid_idx = 0
-                             start_t = 0.0
-                             for k in range(len(line_tokens)):
-                                 if line_tokens[k]['time'] is not None:
-                                     start_valid_idx = k
-                                     start_t = line_tokens[k]['time']
-                                     break
-                             
-                             # 如果起始时间本身就晚于限制，那说明上一行可能就有问题，或者这行本身有问题
-                             if start_t >= hard_limit: 
-                                 # 强制回退起始时间，尽量保留 0.2s 的持续时间
-                                 start_t = max(0, hard_limit - 0.2)
-                             
-                             duration = hard_limit - start_t
-                             if duration < 0.1: duration = 0.1
-                             
-                             # 重新分配时间 (只针对 start_valid_idx 到 last_valid_idx 之间的有效token)
-                             # 为了简单，我们对这段区间内的所有token重新插值
-                             # 注意：这里我们覆盖所有 token，包括中间可能是 None 的
-                             
-                             count = last_valid_idx - start_valid_idx + 1
-                             if count > 0:
-                                 step = duration / count
-                                 for k in range(count):
-                                     idx = start_valid_idx + k
-                                     line_tokens[idx]['time'] = start_t + (k * step)
-                             
-                             current_last_time = line_tokens[last_valid_idx]['time']
+                 logger.warning(f"Line {line_idx+1} overlap detected. Compressing to fit before {next_line_start}s")
 
-            # 生成结果行
-            line_str, effective_start = self._construct_line_string(line_tokens, target_line, 0.0) # last_valid_time 已在内部处理
-            output_lines.append(line_str)
-            
-            # 处理翻译行
-            if i in self.parser.translations:
-                final_time = effective_start if effective_start is not None else current_last_time
-                for trans_text in self.parser.translations[i]:
-                    output_lines.append(f"[{format_time(final_time, self.time_offset)}]{trans_text}")
-                    
-        return "\n".join(output_lines)
+                 for k, t in enumerate(line_tokens):
+                     t['time'] = start_time + (k * step)
 
-    def _generate_raw_lrc(self, result, stop_event):
+                 if line_tokens:
+                     current_last_time = line_tokens[-1]['time']
+                     is_force_calibrated = True
+
+        # === 平均分配逻辑 (Average Distribution) ===
+        if is_force_calibrated and self.enable_avg_distribution:
+            current_last_time = self._apply_average_distribution(
+                line_idx, line_tokens, original_ts, next_line_start
+            )
+
+        return current_last_time
+
+    def _apply_average_distribution(
+        self,
+        line_idx: int,
+        line_tokens: List[Dict[str, Any]],
+        original_ts: float,
+        next_line_start: Optional[float],
+    ) -> float:
+        """对行内 token 应用平均分配策略
+
+        Returns:
+            更新后的 current_last_time
+        """
+        logger.info(f"Line {line_idx+1} applying average distribution.")
+        token_count = len(line_tokens)
+        if token_count == 0:
+            return 0.0
+
+        start_time = original_ts
+        target_end = start_time + (token_count * self.AVG_CHAR_DURATION)
+
+        if next_line_start:
+            target_end_limit = next_line_start - self.LINE_BOUNDARY_GAP
+            if target_end_limit - start_time < self.AVG_MIN_INTERVAL:
+                target_end = start_time + (token_count * self.AVG_CHAR_DURATION_NARROW)
+            else:
+                target_end = target_end_limit
+        else:
+            target_end = start_time + (token_count * self.AVG_CHAR_DURATION)
+
+        current_shifted_end = line_tokens[-1]['time']
+        if current_shifted_end and (current_shifted_end - start_time) > (token_count * self.AVG_SLOW_THRESHOLD):
+             potential_end = max(target_end, current_shifted_end)
+             if next_line_start and potential_end > next_line_start - self.LINE_BOUNDARY_GAP:
+                 target_end = next_line_start - self.LINE_BOUNDARY_GAP
+             else:
+                 target_end = potential_end
+
+        duration = max(self.AVG_MIN_DURATION, target_end - start_time)
+        step = duration / token_count
+
+        for k, t in enumerate(line_tokens):
+            t['time'] = start_time + (k * step)
+
+        return line_tokens[-1]['time'] if line_tokens else 0.0
+
+    def _enforce_hard_boundary(
+        self,
+        line_idx: int,
+        line_tokens: List[Dict[str, Any]],
+        current_last_time: float,
+    ) -> float:
+        """最终硬边界安全检查，确保不越界到下一行
+
+        Returns:
+            更新后的 current_last_time
+        """
+        if line_idx + 1 >= len(self.parser.lines_timestamps):
+            return current_last_time
+
+        next_ts_limit = self.parser.lines_timestamps[line_idx + 1]
+        if next_ts_limit <= 0:
+            return current_last_time
+
+        hard_limit = next_ts_limit - self.HARD_BOUNDARY_GAP
+
+        # 寻找最后一个有效的时间戳
+        last_valid_idx = -1
+        last_valid_time = None
+        for k in range(len(line_tokens) - 1, -1, -1):
+            if line_tokens[k]['time'] is not None:
+                last_valid_idx = k
+                last_valid_time = line_tokens[k]['time']
+                break
+
+        if last_valid_idx == -1 or last_valid_time is None:
+            return current_last_time
+
+        if last_valid_time <= hard_limit:
+            return current_last_time
+
+        logger.warning(f"Line {line_idx+1} final check: End={last_valid_time:.3f}s > Next={next_ts_limit:.3f}s. Compressing...")
+
+        # 确定起始时间
+        start_valid_idx = 0
+        start_t = 0.0
+        for k in range(len(line_tokens)):
+            if line_tokens[k]['time'] is not None:
+                start_valid_idx = k
+                start_t = line_tokens[k]['time']
+                break
+
+        if start_t >= hard_limit:
+            start_t = max(0, hard_limit - self.HARD_BOUNDARY_FALLBACK_DURATION)
+
+        duration = hard_limit - start_t
+        if duration < self.HARD_BOUNDARY_MIN_DURATION:
+            duration = self.HARD_BOUNDARY_MIN_DURATION
+
+        count = last_valid_idx - start_valid_idx + 1
+        if count > 0:
+            step = duration / count
+            for k in range(count):
+                idx = start_valid_idx + k
+                line_tokens[idx]['time'] = start_t + (k * step)
+
+        return line_tokens[last_valid_idx]['time']
+
+    def _append_translation_lines(
+        self,
+        output_lines: List[str],
+        line_idx: int,
+        effective_start: Optional[float],
+        current_last_time: float,
+    ) -> None:
+        """追加翻译行到输出"""
+        if line_idx in self.parser.translations:
+            final_time = effective_start if effective_start is not None else current_last_time
+            for trans_text in self.parser.translations[line_idx]:
+                output_lines.append(f"[{format_time(final_time, self.time_offset)}]{trans_text}")
+
+    def _generate_raw_lrc(self, result: Any, stop_event: Event) -> str:
+        """无参考文本时，直接输出 Whisper 识别结果为 LRC"""
         lines = []
         segments = self._get_attr(result, 'segments', [])
         if not segments:
@@ -363,8 +422,8 @@ class LrcAligner:
                     })
         return ai_char_sequence
 
-    def _tokenize_line(self, line):
-        """分词函数，将行文本拆分为token"""
+    def _tokenize_line(self, line: str) -> List[Dict[str, Any]]:
+        """将行文本拆分为 token（CJK 按字、英文按词）"""
         tokens = []
         token_iter = re.finditer(r'([a-zA-Z0-9\']+|[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff])', line)
         last_end_idx = 0
@@ -380,7 +439,8 @@ class LrcAligner:
             })
         return tokens
 
-    def _extract_words_from_result(self, result):
+    def _extract_words_from_result(self, result: Any) -> None:
+        """从 Whisper 结果中提取所有单词和句子级 Segment"""
         self.ai_words_pool = []
         self.ai_segments_pool = []
         segments = self._get_attr(result, 'segments', [])
@@ -396,111 +456,8 @@ class LrcAligner:
             words = self._get_attr(seg, 'words', [])
             if words: self.ai_words_pool.extend(words)
 
-    def _map_lines_to_segments(self, lines: List[str]) -> Dict[int, int]:
-        """
-        建立 User Line Index -> AI Segment Index 的映射
-        """
-        mapping = {}
-        ai_texts = [self._get_attr(s, 'text', '').strip() for s in self.ai_segments_pool]
-        
-        # 简单的一对一或多对一匹配
-        # 这里使用 difflib 寻找最相似的句子
-        # 注意：Whisper 的分句可能和 LRC 行不完全一致（可能一句LRC对应两句Whisper，反之亦然）
-        # 这里实现一个简单的贪心匹配算法
-        
-        ai_cursor = 0
-        for i, line in enumerate(lines):
-            best_ratio = 0.0
-            best_idx = -1
-            
-            # 在 ai_cursor 附近搜索
-            search_range = 3 # 向后搜索 3 句
-            for offset in range(search_range):
-                curr = ai_cursor + offset
-                if curr >= len(ai_texts): break
-                
-                ratio = difflib.SequenceMatcher(None, line, ai_texts[curr]).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_idx = curr
-            
-            if best_ratio > 0.3: # 阈值
-                mapping[i] = best_idx
-                ai_cursor = best_idx # 允许同一句 Whisper 对应多行 LRC (不推进 cursor)，或者推进一步
-                # 如果匹配度很高，通常意味着这句话被消耗了，但考虑到长句可能被拆分，我们保守推进
-                if best_idx == ai_cursor:
-                    pass # 留在当前句
-                else:
-                    ai_cursor = best_idx
-            else:
-                # 如果没匹配上，可能沿用上一个 Segment，或者暂时不约束
-                pass
-                
-        return mapping
-
-    def _match_time_for_line(self, line_tokens, search_window, last_valid_time, seg_start_constraint, seg_end_constraint):
-        total_ai_words = len(self.ai_words_pool)
-        
-        current_dynamic_window = search_window
-        consecutive_matches = 0
-
-        for token in line_tokens:
-            user_clean = self._clean_token(token['text'])
-            matched_time = None
-            
-            if consecutive_matches > 3:
-                current_dynamic_window = max(5, search_window // 2)
-            else:
-                current_dynamic_window = search_window
-
-            found_in_window = False
-            
-            # 优先在约束范围内搜索
-            # 我们需要找到 pool_cursor 之后，且时间在 [seg_start, seg_end] 范围内的单词
-            
-            for offset in range(current_dynamic_window):
-                if self.pool_cursor + offset >= total_ai_words: break
-                
-                ai_w_obj = self.ai_words_pool[self.pool_cursor + offset]
-                w_start = self._get_attr(ai_w_obj, 'start', 0.0)
-                
-                # 核心约束逻辑：
-                # 1. 单词时间必须 >= 上一个有效时间 (保持时序)
-                # 2. 如果有 Segment 约束，单词时间最好在 Segment 范围内 (允许少量误差)
-                # 3. 如果单词时间远远超过了 Segment 结束时间，说明可能漂移到了下一句，应拒绝
-                
-                is_time_valid = True
-                if w_start < last_valid_time - 0.5: is_time_valid = False
-                
-                # 如果当前单词时间比 Segment 结束时间晚太多（比如 > 1秒），则认为是下一句的词
-                if seg_end_constraint != float('inf') and w_start > seg_end_constraint + 1.0:
-                    is_time_valid = False
-                
-                # 如果单词时间比 Segment 开始时间早太多，也不对
-                if w_start < seg_start_constraint - 1.0:
-                    is_time_valid = False
-
-                if is_time_valid:
-                    ai_text = self._get_attr(ai_w_obj, 'word', "")
-                    ai_clean = self._clean_token(ai_text)
-                    
-                    if user_clean and ai_clean and (user_clean in ai_clean or ai_clean in user_clean):
-                        matched_time = w_start
-                        self.pool_cursor = self.pool_cursor + offset + 1
-                        found_in_window = True
-                        break
-            
-            # (省略掉之前的“紧急扩大窗口”逻辑，因为有了 Segment 约束，乱跑的概率降低，不需要盲目扩大搜索)
-
-            if found_in_window:
-                consecutive_matches += 1
-            else:
-                consecutive_matches = 0
-            
-            token['time'] = matched_time
-        return last_valid_time
-
-    def _clean_hallucinations(self, line_tokens):
+    def _clean_hallucinations(self, line_tokens: List[Dict[str, Any]]) -> None:
+        """清洗行内时间跳变的幻觉时间戳"""
         count = len(line_tokens)
         if count < 2: return
         
@@ -515,48 +472,62 @@ class LrcAligner:
             
             if t1 is not None and t2 is not None:
                 # 如果同一行内两字间隔超过 3秒，且 t1 可能是幻觉
-                if t2 - t1 > 3.0:
+                if t2 - t1 > self.HALLUCINATION_GAP_THRESHOLD:
                     line_tokens[k]["time"] = None
 
-    def _interpolate_timestamps(self, line_tokens, prev_line_end_time):
-        count = len(line_tokens)
-        for k in range(count):
-            if line_tokens[k]["time"] is None:
-                # 找前一个锚点
-                prev_time = prev_line_end_time
-                for j in range(k - 1, -1, -1):
-                    if line_tokens[j]["time"] is not None:
-                        prev_time = line_tokens[j]["time"]
-                        break
-                
-                # 找后一个锚点
-                next_time = None
-                steps_to_next = 0
-                for j in range(k + 1, count):
-                    if line_tokens[j]["time"] is not None:
-                        next_time = line_tokens[j]["time"]
-                        break
-                    steps_to_next += 1
-                
-                # 插值逻辑
-                if next_time is not None:
-                    gap = next_time - prev_time
-                    if gap > 2.5:
-                        # 右吸附策略
-                        est_duration = 0.3
-                        back_calc_time = next_time - ((steps_to_next + 1) * est_duration)
-                        line_tokens[k]["time"] = max(prev_time + 0.1, back_calc_time)
-                    else:
-                        # 平滑插值
-                        steps = steps_to_next + 1
-                        step_gap = gap / (steps + 1)
-                        step_gap = max(MIN_DURATION, min(step_gap, 0.4))
-                        line_tokens[k]["time"] = prev_time + step_gap
-                else:
-                    # 左吸附
-                    line_tokens[k]["time"] = prev_time + 0.25
+    def _interpolate_timestamps(self, line_tokens: List[Dict[str, Any]], prev_line_end_time: float) -> None:
+        """对行内缺失时间戳的 token 进行智能插值
 
-    def _construct_line_string(self, line_tokens, original_line, last_valid_time):
+        预先构建锚点索引，O(n) 完成插值，而非每个缺失 token 都线性搜索。
+        """
+        count = len(line_tokens)
+        if count == 0:
+            return
+
+        # 预构建: 每个位置对应的下一个有效锚点索引
+        next_anchor = [None] * count
+        last_anchor_idx = None
+        for i in range(count - 1, -1, -1):
+            if line_tokens[i]["time"] is not None:
+                last_anchor_idx = i
+            next_anchor[i] = last_anchor_idx
+
+        # 遍历插值
+        prev_time = prev_line_end_time
+        for k in range(count):
+            if line_tokens[k]["time"] is not None:
+                prev_time = line_tokens[k]["time"]
+                continue
+
+            # 后锚点
+            na_idx = next_anchor[k]
+            next_time = line_tokens[na_idx]["time"] if na_idx is not None else None
+            steps_to_next = (na_idx - k - 1) if na_idx is not None else 0
+
+            # 插值逻辑
+            if next_time is not None:
+                gap = next_time - prev_time
+                if gap > self.INTERPOLATION_LARGE_GAP:
+                    est_duration = self.INTERPOLATION_EST_CHAR_DURATION
+                    back_calc_time = next_time - ((steps_to_next + 1) * est_duration)
+                    line_tokens[k]["time"] = max(prev_time + self.INTERPOLATION_MIN_FORWARD_GAP, back_calc_time)
+                else:
+                    steps = steps_to_next + 1
+                    step_gap = gap / (steps + 1)
+                    step_gap = max(MIN_DURATION, min(step_gap, self.INTERPOLATION_MAX_STEP))
+                    line_tokens[k]["time"] = prev_time + step_gap
+            else:
+                line_tokens[k]["time"] = prev_time + self.INTERPOLATION_LEFT_ATTACH_STEP
+
+            prev_time = line_tokens[k]["time"]
+
+    def _construct_line_string(
+        self,
+        line_tokens: List[Dict[str, Any]],
+        original_line: str,
+        last_valid_time: float,
+    ) -> tuple[str, Optional[float]]:
+        """将 token 列表组装为带时间标签的 LRC 行"""
         if not line_tokens:
             return original_line, None
             

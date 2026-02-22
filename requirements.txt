@@ -1,7 +1,20 @@
-PyQt6>=6.4.0
+# === AI / ML 核心 ===
 torch>=2.0.0
 torchaudio>=2.0.0
 stable-ts>=2.1.0
 openai-whisper>=20231117
 faster-whisper>=0.10.0
 requests>=2.28.0
+
+# === MSST 人声分离 ===
+# MSST 推理依赖（需要从 MSST-WebUI 项目获取推理模块）
+# https://github.com/SUC-DriverOld/MSST-WebUI
+pyyaml>=6.0
+numpy>=1.24.0
+
+# === Web 框架 ===
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.6
+websockets>=12.0
+aiofiles>=23.0.0

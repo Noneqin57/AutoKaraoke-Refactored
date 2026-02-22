@@ -4,7 +4,12 @@ from typing import List, Dict
 from utils.time_utils import parse_time_tag
 
 class LrcParser:
-    def __init__(self):
+    """LRC/TXT/SRT 歌词文件解析器
+
+    解析歌词文件，提取头部标签、歌词文本、翻译行和时间戳。
+    支持多种编码和格式。
+    """
+    def __init__(self) -> None:
         self.headers: List[str] = []
         self.lines_text: List[str] = []
         self.translations: Dict[int, List[str]] = {}
@@ -22,12 +27,35 @@ class LrcParser:
         # 用于移除行内所有时间标签
         self.remove_tags_pattern = re.compile(r'\[\d{1,2}:\d{1,2}(?:[\.:]\d{1,3})?\]')
         self.remove_html_pattern = re.compile(r'<.*?>')
+        
+        # 噪音行模式（结构性标记、非歌词行）
+        self.noise_pattern = re.compile(
+            r"^(?:"
+            # 英文标记 (IgnoreCase)
+            r"Instrumental|Interlude|Intro|Outro|Bridge|Chorus|Hook|Verse|Solo|Dialogue|"
+            # 中文标记
+            r"间奏|前奏|尾奏|独白|对话|"
+            # 日文标记
+            r"間奏|前奏|後奏|セリフ|台詞|閑話休題|カットイン"
+            r")(?:\s*[:：\d]*)?$", 
+            re.IGNORECASE
+        )
 
     def parse(self, content: str, ext: str) -> str:
+        """解析歌词文件内容
+
+        Args:
+            content: 歌词文件的原始文本内容
+            ext: 文件扩展名，如 '.lrc', '.txt', '.srt'
+
+        Returns:
+            纯歌词文本（各行用换行符连接）
+        """
         self.headers = []
         self.lines_text = []
         self.translations = {}
-        
+        self.lines_timestamps = []
+
         content = content.lstrip('\ufeff')
         lines = content.splitlines()
         
@@ -62,6 +90,13 @@ class LrcParser:
             
             if not text_only: continue
             
+            # 检查是否为噪音行/结构标记
+            if self.noise_pattern.match(text_only):
+                # 视为 header 或直接丢弃，不作为歌词
+                # 暂时存入 headers 以便保留信息但不参与对齐
+                self.headers.append(f"[noise]{line}")
+                continue
+
             if self.credits_pattern.match(text_only):
                 self.headers.append(line)
                 continue
@@ -79,7 +114,7 @@ class LrcParser:
                 if time_tag:
                     try:
                         ts_val = parse_time_tag(time_tag) / 1000.0 # 转换为秒
-                    except:
+                    except (ValueError, TypeError, AttributeError):
                         ts_val = -1.0
                 self.lines_timestamps.append(ts_val)
                 

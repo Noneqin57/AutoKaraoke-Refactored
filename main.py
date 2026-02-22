@@ -1,32 +1,55 @@
 # -*- coding: utf-8 -*-
 """
-AutoKaraoke Refactored
-功能：Whisper 自动歌词生成、双语对齐、自定义 Prompt、歌词打轴
-"""
-import sys
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
+REATK Web 版入口
 
-from ui.main_window import LyricsGenApp
+启动 uvicorn 服务并自动打开浏览器。
+使用方式: python main.py
+"""
+import os
+import sys
+import time
+import threading
+import webbrowser
+
+HOST = "127.0.0.1"
+PORT = 18632
+
+
+def open_browser():
+    """延迟一秒后打开浏览器"""
+    time.sleep(1.5)
+    url = f"http://{HOST}:{PORT}"
+    print(f"🌐 正在打开浏览器: {url}")
+    webbrowser.open(url)
 
 
 def main():
-    """应用程序主入口"""
-    app = QApplication(sys.argv)
-    
-    # 高DPI支持
-    try:
-        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-        app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
-    except AttributeError:
-        pass
-    
-    # 创建并显示主窗口
-    window = LyricsGenApp()
-    window.show()
-    
-    return app.exec()
+    """主入口"""
+    import uvicorn
+
+    print("=" * 50)
+    print("  REATK - AutoKaraoke Refactored (Web 版)")
+    print(f"  服务地址: http://{HOST}:{PORT}")
+    print(f"  API 文档: http://{HOST}:{PORT}/docs")
+    print("=" * 50)
+
+    # 在后台线程中打开浏览器
+    browser_thread = threading.Thread(target=open_browser, daemon=True)
+    browser_thread.start()
+
+    # 启动 uvicorn
+    uvicorn.run(
+        "server:create_app",
+        host=HOST,
+        port=PORT,
+        factory=True,
+        reload=False,
+        log_level="info",
+    )
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # Windows multiprocessing 兼容
+    from multiprocessing import freeze_support
+    freeze_support()
+    main()
