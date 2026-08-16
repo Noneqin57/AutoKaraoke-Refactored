@@ -74,7 +74,7 @@ class WordLevelEditor(QDialog):
         preview_container = QVBoxLayout()
         preview_container.setSpacing(5)
         
-        lbl_hint = QLabel("🎶 实时预览 (Karaoke Preview)")
+        lbl_hint = QLabel("实时预览 (Karaoke Preview)")
         lbl_hint.setStyleSheet("color: #909399; font-size: 12px;")
         preview_container.addWidget(lbl_hint)
         
@@ -159,18 +159,18 @@ class WordLevelEditor(QDialog):
         
         # 提示信息
         tips_lay = QHBoxLayout()
-        tips = QLabel("💡 快捷键: [Space]播放/暂停 | [Enter]打点 | [←/→]切换选中 | [↑/↓]微调时间(±50ms) | [Ctrl+Z]撤销")
+        tips = QLabel("快捷键: [Space]播放/暂停 | [Enter]打点 | [←/→]切换选中 | [↑/↓]微调时间(±50ms) | [Ctrl+Z]撤销")
         tips.setStyleSheet("color: #606266; font-style: italic;")
         tips_lay.addWidget(tips)
         layout.addLayout(tips_lay)
         
         # 底部按钮
         btn_box = QHBoxLayout()
-        btn_replay = QPushButton("⏪ 重播本句")
+        btn_replay = QPushButton("重播本句")
         btn_replay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_replay.clicked.connect(self.replay_line)
         
-        btn_save = QPushButton("💾 确认并保存")
+        btn_save = QPushButton("确认并保存")
         btn_save.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_save.setStyleSheet("background: #67c23a; color: white; font-weight: bold; padding: 10px;")
         btn_save.clicked.connect(self.save_and_close)
@@ -202,7 +202,8 @@ class WordLevelEditor(QDialog):
         try:
             val = float(text.replace('x', ''))
             self.player.setPlaybackRate(val)
-        except: pass
+        except (ValueError, AttributeError):
+            pass
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Space:

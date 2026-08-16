@@ -3,28 +3,28 @@ import os
 
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
                              QTableWidgetItem, QPushButton, QProgressBar, QLabel,
-                             QHeaderView, QMessageBox, QWidget, QLineEdit, QFormLayout)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
+                             QHeaderView, QMessageBox, QWidget)
+from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
-from core.model_manager import ModelManager, ModelInfo, ModelDownloader, ModelType
+from core.model_manager import DownloadStopped, ModelManager, ModelInfo, ModelDownloader
 from config import ConfigManager
 
 class DownloadWorker(QObject):
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str) # success, msg
 
-    def __init__(self, model_info: ModelInfo, mirror_url: str = None):
+    def __init__(self, model_info: ModelInfo):
         super().__init__()
         self.model_info = model_info
-        self.mirror_url = mirror_url
         self.downloader = None
 
     def run(self):
         try:
             self.downloader = ModelDownloader(self.model_info, self._callback)
-            self.downloader.set_mirror(self.mirror_url)
             self.downloader.start()
             self.finished.emit(True, "Success")
+        except DownloadStopped:
+            self.finished.emit(False, "Stopped")
         except Exception as e:
             self.finished.emit(False, str(e))
 
@@ -61,22 +61,9 @@ class ModelManagerDialog(QDialog):
     def setup_ui(self):
         layout = QVBoxLayout(self)
         
-        info_lbl = QLabel("提示: Faster-Whisper 模型通常比标准模型更快且精度接近。\n如果网速较慢，请优先下载 Small 或 Medium 模型。")
+        info_lbl = QLabel("提示: 模型来自 OpenAI 官方源（Original Whisper）。\n如果网速较慢，请优先下载 Small 或 Medium 模型。")
         info_lbl.setStyleSheet("color: #666; margin-bottom: 10px;")
         layout.addWidget(info_lbl)
-
-        # Mirror settings
-        mirror_layout = QHBoxLayout()
-        mirror_layout.addWidget(QLabel("下载镜像源 (Faster-Whisper):"))
-        self.mirror_edit = QLineEdit()
-        self.mirror_edit.setText(self.config.get("HF_MIRROR", "https://hf-mirror.com"))
-        self.mirror_edit.setPlaceholderText("https://hf-mirror.com")
-        self.mirror_edit.setToolTip("设置 HuggingFace 镜像源以加速国内下载")
-        save_mirror_btn = QPushButton("保存镜像设置")
-        save_mirror_btn.clicked.connect(self.save_mirror_config)
-        mirror_layout.addWidget(self.mirror_edit)
-        mirror_layout.addWidget(save_mirror_btn)
-        layout.addLayout(mirror_layout)
 
         self.table = QTableWidget()
         self.table.setColumnCount(5)
@@ -96,13 +83,6 @@ class ModelManagerDialog(QDialog):
         btn_box.addWidget(close_btn)
         layout.addLayout(btn_box)
 
-    def save_mirror_config(self):
-        url = self.mirror_edit.text().strip()
-        if not url: return
-        self.config.set("HF_MIRROR", url)
-        self.config.save()
-        QMessageBox.information(self, "成功", "镜像源设置已保存。")
-
     def refresh_list(self):
         # Keep existing rows if possible to avoid flicker, but full refresh is safer for logic
         self.table.setRowCount(0)
@@ -116,8 +96,6 @@ class ModelManagerDialog(QDialog):
             
             # Type
             type_item = QTableWidgetItem(model.type)
-            if model.type == ModelType.FASTER_WHISPER:
-                type_item.setForeground(Qt.GlobalColor.darkGreen)
             self.table.setItem(i, 1, type_item)
             
             # Status
@@ -172,8 +150,7 @@ class ModelManagerDialog(QDialog):
 
         # Create Thread
         thread = QThread()
-        mirror = self.config.get("HF_MIRROR", "https://hf-mirror.com")
-        worker = DownloadWorker(model, mirror)
+        worker = DownloadWorker(model)
         worker.moveToThread(thread)
         
         thread.started.connect(worker.run)
@@ -222,7 +199,8 @@ class ModelManagerDialog(QDialog):
             QMessageBox.information(self, "成功", f"模型 {self.model_list[row].name} 下载完成")
         else:
             self.refresh_row(row)
-            QMessageBox.critical(self, "错误", f"下载失败: {msg}")
+            if msg != "Stopped":
+                QMessageBox.critical(self, "错误", f"下载失败: {msg}")
 
     def cleanup_thread(self, row):
         if row in self.download_threads:

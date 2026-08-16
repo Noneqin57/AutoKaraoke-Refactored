@@ -2,20 +2,21 @@
 import os
 import shutil
 import requests
-import threading
+import time
+import logging
 from dataclasses import dataclass
-from typing import List, Dict, Optional, Callable
+from typing import List, Optional, Callable
 
-# Try to import huggingface_hub for faster-whisper models
-try:
-    from huggingface_hub import HfApi, hf_hub_download
-    HAS_HF_HUB = True
-except ImportError:
-    HAS_HF_HUB = False
+logger = logging.getLogger(__name__)
 
 class ModelType:
-    FASTER_WHISPER = "Faster-Whisper"
     ORIGINAL_WHISPER = "Original Whisper"
+
+class DownloadStopped(Exception):
+    """用户主动停止下载。"""
+
+MAX_DOWNLOAD_RETRIES = 5
+RETRY_BACKOFF_BASE = 2
 
 @dataclass
 class ModelInfo:
@@ -26,16 +27,6 @@ class ModelInfo:
     local_path: str = ""
     size_mb: float = 0
     is_downloaded: bool = False
-
-# Mapping for Faster Whisper (Systran)
-FASTER_WHISPER_MODELS = {
-    "tiny": "Systran/faster-whisper-tiny",
-    "base": "Systran/faster-whisper-base",
-    "small": "Systran/faster-whisper-small",
-    "medium": "Systran/faster-whisper-medium",
-    "large-v2": "Systran/faster-whisper-large-v2",
-    "large-v3": "Systran/faster-whisper-large-v3",
-}
 
 # Mapping for Original Whisper (OpenAI)
 # URLs from https://github.com/openai/whisper/blob/main/whisper/__init__.py
@@ -57,28 +48,14 @@ class ModelManager:
     def get_model_list(self) -> List[ModelInfo]:
         models = []
         
-        # Faster Whisper Models
-        if HAS_HF_HUB:
-            for name, repo_id in FASTER_WHISPER_MODELS.items():
-                # For Faster Whisper, stable-whisper/faster-whisper downloads to a subdir usually
-                # But here we implement strict path management.
-                # If we use ModelManager, we download to base_dir/faster-whisper-name/
-                local_path = os.path.join(self.base_dir, f"faster-whisper-{name}")
-                is_downloaded = self._check_faster_whisper_integrity(local_path)
-                
-                models.append(ModelInfo(
-                    name=name,
-                    type=ModelType.FASTER_WHISPER,
-                    key=name,
-                    repo_id_or_url=repo_id,
-                    local_path=local_path,
-                    is_downloaded=is_downloaded
-                ))
-        
         # Original Whisper Models
         for name, url in ORIGINAL_WHISPER_MODELS.items():
             local_path = os.path.join(self.base_dir, f"{name}.pt")
-            is_downloaded = os.path.exists(local_path) 
+            is_downloaded = (
+                os.path.isfile(local_path)
+                and os.path.getsize(local_path) > 1024 * 1024
+                and not os.path.exists(local_path + ".part")
+            )
             # Could check file size/hash if we want to be strict
             
             models.append(ModelInfo(
@@ -92,16 +69,6 @@ class ModelManager:
             
         return models
 
-    def _check_faster_whisper_integrity(self, path: str) -> bool:
-        if not os.path.isdir(path):
-            return False
-        # Minimal check: config.json and model.bin must exist
-        required = ["config.json", "model.bin"]
-        for f in required:
-            if not os.path.exists(os.path.join(path, f)):
-                return False
-        return True
-
     def delete_model(self, model_info: ModelInfo):
         if not model_info.is_downloaded:
             return
@@ -112,7 +79,7 @@ class ModelManager:
             elif os.path.isfile(model_info.local_path):
                 os.remove(model_info.local_path)
         except Exception as e:
-            print(f"Error deleting model: {e}")
+            logger.error("Error deleting model: %s", e)
 
 class ModelDownloader:
     """Helper to download models with progress callback"""
@@ -121,18 +88,9 @@ class ModelDownloader:
         self.callback = progress_callback
         self.stop_flag = False
 
-    def set_mirror(self, mirror_url: Optional[str]):
-        if mirror_url:
-            self.mirror_url = mirror_url
-            # Set environment variable for HF
-            os.environ["HF_ENDPOINT"] = mirror_url
-
     def start(self):
         try:
-            if self.model.type == ModelType.FASTER_WHISPER:
-                self._download_hf()
-            else:
-                self._download_url()
+            self._download_url()
         except Exception as e:
             if self.callback:
                 # If stopped manually, it might not be an error
@@ -146,93 +104,134 @@ class ModelDownloader:
     def stop(self):
         self.stop_flag = True
 
-    def _download_hf(self):
-        # Using huggingface_hub api to list files and download them one by one for progress
-        if not HAS_HF_HUB:
-            raise ImportError("huggingface_hub not installed")
-            
-        api = HfApi(endpoint=os.environ.get("HF_ENDPOINT"))
-        repo_id = self.model.repo_id_or_url
-        target_dir = self.model.local_path
-        
-        os.makedirs(target_dir, exist_ok=True)
-        
-        if self.callback: self.callback(0, "Fetching file list...")
-        
-        # Get list of files
-        repo_files = api.list_repo_files(repo_id=repo_id)
-        # Filter out git/meta files
-        files_to_download = [f for f in repo_files if not f.startswith('.')]
-        
-        total_files = len(files_to_download)
-        
-        # Note: Proper size based progress is hard with snapshot_download without a custom tracker
-        # and listing all file sizes first is slow. We will use file count + per-file progress if possible
-        # Or just download file by file.
-        
-        for i, filename in enumerate(files_to_download):
-            if self.stop_flag: break
-            
-            if self.callback: 
-                self.callback(int((i / total_files) * 100), f"Downloading {filename}...")
-            
-            # Use requests to download for granular progress within file
-            # Get download URL
-            # Note: hf_hub_url gives us the url
-            # But wait, faster-whisper expects a specific directory structure.
-            # Using hf_hub_download is safer but lacks progress callback that is easy to hook.
-            # Let's try hf_hub_download with local_dir
-            
-            try:
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    local_dir=target_dir
-                )
-            except TypeError:
-                hf_hub_download(
-                    repo_id=repo_id,
-                    filename=filename,
-                    local_dir=target_dir,
-                    local_dir_use_symlinks=False
-                )
-            
-        if not self.stop_flag and self.callback:
-            self.callback(100, "Download Complete")
+    def _stream_download(self, url, dest, part_path, start_percent=0, end_percent=100, label="Downloading"):
+        """流式下载核心：Range 断点续传 + 字节进度 + .part 原子改名。
 
-    def _download_url(self):
+        Returns:
+            True  —— 下载完成并已原子改名
+            False —— 用户停止，.part 已清理
+        """
+        resume_pos = 0
+        if os.path.exists(part_path):
+            try:
+                resume_pos = os.path.getsize(part_path)
+            except OSError:
+                resume_pos = 0
+
+        headers = {}
+        mode = 'wb'
+        if resume_pos > 0:
+            headers['Range'] = f"bytes={resume_pos}-"
+            mode = 'ab'
+
+        response = requests.get(url, stream=True, timeout=(5, 30), headers=headers)
+        if response.status_code not in (200, 206):
+            raise RuntimeError(f"HTTP {response.status_code}")
+        if response.status_code == 200:
+            # 服务器不支持断点：从头下载
+            resume_pos = 0
+            mode = 'wb'
+
+        total_remaining = int(response.headers.get('content-length', 0))
+        received = 0
+        with open(part_path, mode) as f:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if self.stop_flag:
+                    break
+                if chunk:
+                    f.write(chunk)
+                    received += len(chunk)
+                    if self.callback:
+                        if total_remaining > 0:
+                            total_expected = resume_pos + total_remaining
+                            current = resume_pos + received
+                            frac = min(1.0, current / max(1, total_expected))
+                            pct = int(
+                            start_percent + frac * (end_percent - start_percent)
+                            )
+                            self.callback(pct, f"{label}... {pct}%")
+                        else:
+                            received_mb = received / (1024 * 1024)
+                            self.callback(-2, f"{label}... 已接收 {received_mb:.1f} MB")
+
+
+        if self.stop_flag:
+            try:
+                os.remove(part_path)
+            except OSError:
+                pass
+            return False
+
+        if total_remaining > 0 and received < total_remaining:
+            raise RuntimeError(
+                f"Incomplete download: {received}/{total_remaining} bytes"
+            )
+
+        if total_remaining == 0 and received == 0:
+            raise RuntimeError("Empty response body")
+
+        os.replace(part_path, dest)
+        return True
+
+    def _download_url_once(self):
         url = self.model.repo_id_or_url
         dest = self.model.local_path
+        part_path = dest + ".part"
         
         # Ensure dir
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         
         if self.callback: self.callback(0, "Connecting...")
-        
-        response = requests.get(url, stream=True, timeout=10)
-        total_size = int(response.headers.get('content-length', 0))
-        
-        if response.status_code != 200:
-            raise Exception(f"HTTP Error: {response.status_code}")
-            
-        downloaded = 0
-        chunk_size = 1024 * 1024 # 1MB
-        
-        with open(dest, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if self.stop_flag: 
-                    break
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0 and self.callback:
-                        percent = int((downloaded / total_size) * 100)
-                        self.callback(percent, f"Downloading... {percent}%")
-                        
+
+        completed = self._stream_download(url, dest, part_path, label="Downloading")
+        if not completed:
+            raise DownloadStopped("已暂停")
+        if completed and self.callback:
+            self.callback(100, "Download Complete")
+        return
+
+
+    def _download_url(self):
+        """带重试的 URL 下载入口，内部调用 _download_url_once。"""
+        url = self.model.repo_id_or_url
+        dest = self.model.local_path
+
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        last_error = None
+        for attempt in range(1, 4):
+            if self.stop_flag:
+                break
+            try:
+                self._download_url_once()
+                return
+            except Exception as e:
+                last_error = e
+                logger.warning("Model download attempt %d/3 failed: %s", attempt, e)
+                if self.callback:
+                    self.callback(0, f"Retry {attempt}/3: {e}")
+                time.sleep(1)
+
         if self.stop_flag:
-            # Cleanup partial
             try:
                 os.remove(dest)
-            except: pass
-        else:
-            if self.callback: self.callback(100, "Download Complete")
+            except OSError:
+                pass
+            try:
+                os.remove(dest + ".part")
+            except OSError:
+                pass
+            raise DownloadStopped("已暂停")
+            return
+
+        # 3 次失败后清理残留的临时文件
+        try:
+            if os.path.exists(dest):
+                os.remove(dest)
+            if os.path.exists(dest + ".part"):
+                os.remove(dest + ".part")
+        except OSError:
+            pass
+
+        logger.error("Model download failed after 3 attempts: %s", last_error)
+        raise last_error if last_error else Exception("Download failed")

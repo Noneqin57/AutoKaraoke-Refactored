@@ -3,6 +3,7 @@
 AutoKaraoke Refactored
 功能：Whisper 自动歌词生成、双语对齐、自定义 Prompt、歌词打轴
 """
+import multiprocessing
 import sys
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
@@ -12,6 +13,8 @@ from ui.main_window import LyricsGenApp
 
 def main():
     """应用程序主入口"""
+    # 支持 PyInstaller 等打包后运行 multiprocessing（Windows spawn）
+    multiprocessing.freeze_support()
     app = QApplication(sys.argv)
     
     # 高DPI支持

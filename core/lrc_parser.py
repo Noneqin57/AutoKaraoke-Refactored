@@ -23,10 +23,55 @@ class LrcParser:
         self.remove_tags_pattern = re.compile(r'\[\d{1,2}:\d{1,2}(?:[\.:]\d{1,3})?\]')
         self.remove_html_pattern = re.compile(r'<.*?>')
 
+    def _parse_srt(self, content: str) -> str:
+        """解析 SRT 字幕：取每块的开始时间，文本按行合并为歌词行。"""
+        self.headers = []
+        self.lines_text = []
+        self.translations = {}
+        self.lines_timestamps = []
+
+        content = content.lstrip('\ufeff').strip()
+        blocks = re.split(r'\n\s*\n', content)
+        time_line_pattern = re.compile(
+            r'(\d{1,2}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})\s*-->\s*(\d{1,2}):(\d{1,2}):(\d{1,2})[,.](\d{1,3})'
+        )
+
+        for block in blocks:
+            raw_lines = [line.strip() for line in block.splitlines() if line.strip()]
+            if not raw_lines:
+                continue
+
+            start_seconds = None
+            text_lines = []
+            for line in raw_lines:
+                match = time_line_pattern.search(line)
+                if match:
+                    h, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+                    ms = int(match.group(4).ljust(3, '0'))
+                    start_seconds = h * 3600 + m * 60 + s + ms / 1000.0
+                elif not line.isdigit():
+                    text_lines.append(line)
+
+            if start_seconds is None:
+                continue
+
+            text = " ".join(text_lines).strip()
+            if not text:
+                continue
+
+            self.lines_text.append(text)
+            self.lines_timestamps.append(start_seconds)
+
+        return "\n".join(self.lines_text)
+
     def parse(self, content: str, ext: str) -> str:
         self.headers = []
         self.lines_text = []
         self.translations = {}
+        self.lines_timestamps = []
+
+        if (ext or "").lower() == ".srt":
+            return self._parse_srt(content)
         
         content = content.lstrip('\ufeff')
         lines = content.splitlines()
@@ -79,7 +124,7 @@ class LrcParser:
                 if time_tag:
                     try:
                         ts_val = parse_time_tag(time_tag) / 1000.0 # 转换为秒
-                    except:
+                    except Exception:
                         ts_val = -1.0
                 self.lines_timestamps.append(ts_val)
                 

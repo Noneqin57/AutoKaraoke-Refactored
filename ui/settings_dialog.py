@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QFileDialog, QTabWidget, QWidget,
-                             QComboBox, QSpinBox, QCheckBox, QGroupBox, QFormLayout)
+                             QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGroupBox, QFormLayout)
 from PyQt6.QtCore import Qt
 from config import LANGUAGES, PROMPT_DEFAULTS
 
@@ -63,6 +63,14 @@ class SettingsDialog(QDialog):
         self.offset_spin.setToolTip("整体调整时间戳。\n正数: 时间延后; 负数: 时间提前。")
         offset_lay.addWidget(QLabel("全局偏移:"))
         offset_lay.addWidget(self.offset_spin)
+        self.calibration_spin = QDoubleSpinBox()
+        self.calibration_spin.setRange(0.1, 10.0)
+        self.calibration_spin.setSingleStep(0.1)
+        self.calibration_spin.setDecimals(1)
+        self.calibration_spin.setSuffix(" s")
+        self.calibration_spin.setToolTip("生成时间戳与原时间戳偏差超过该阈值时，强制对齐到原时间戳。")
+        offset_lay.addWidget(QLabel("强制校准阈值:"))
+        offset_lay.addWidget(self.calibration_spin)
         offset_lay.addStretch()
         offset_group.setLayout(offset_lay)
         core_layout.addWidget(offset_group)
@@ -81,7 +89,7 @@ class SettingsDialog(QDialog):
         path_lay1 = QHBoxLayout()
         self.model_path_edit = QLineEdit()
         self.model_path_edit.setReadOnly(True)
-        btn_model = QPushButton("📂")
+        btn_model = QPushButton("…")
         btn_model.clicked.connect(self.browse_model_path)
         path_lay1.addWidget(self.model_path_edit)
         path_lay1.addWidget(btn_model)
@@ -90,7 +98,7 @@ class SettingsDialog(QDialog):
         path_lay2 = QHBoxLayout()
         self.output_path_edit = QLineEdit()
         self.output_path_edit.setReadOnly(True)
-        btn_output = QPushButton("📂")
+        btn_output = QPushButton("…")
         btn_output.clicked.connect(self.browse_output_path)
         path_lay2.addWidget(self.output_path_edit)
         path_lay2.addWidget(btn_output)
@@ -125,19 +133,20 @@ class SettingsDialog(QDialog):
 
     def load_settings(self):
         # Core
-        self.model_combo.setCurrentText(self.config_manager.get("MODEL_SIZE", "large-v2"))
+        self.model_combo.setCurrentText(self.config_manager.get("MODEL_SIZE") or "large-v2")
         
-        saved_lang = self.config_manager.get("LANGUAGE", "ja")
+        saved_lang = self.config_manager.get("LANGUAGE") or "ja"
         index = self.lang_combo.findData(saved_lang)
         if index >= 0: self.lang_combo.setCurrentIndex(index)
         
-        self.prompt_edit.setText(self.config_manager.get("PROMPT", ""))
-        self.offset_spin.setValue(self.config_manager.get("OFFSET", 0))
+        self.prompt_edit.setText(self.config_manager.get("PROMPT") or "")
+        self.offset_spin.setValue(self.config_manager.get("OFFSET") or 0)
+        self.calibration_spin.setValue(float(self.config_manager.get("CALIBRATION_THRESHOLD") or 1.5))
         
         # Path & Adv
-        self.model_path_edit.setText(self.config_manager.get("MODEL_DIR", "models"))
-        self.output_path_edit.setText(self.config_manager.get("OUTPUT_DIR", ""))
-        self.check_release_vram.setChecked(self.config_manager.get("RELEASE_VRAM", True))
+        self.model_path_edit.setText(self.config_manager.get("MODEL_DIR") or "./models")
+        self.output_path_edit.setText(self.config_manager.get("OUTPUT_DIR") or "")
+        self.check_release_vram.setChecked(self.config_manager.get("RELEASE_VRAM", True) is not False)
 
     def on_lang_changed(self, text):
         lang_code = self.lang_combo.currentData()
@@ -166,6 +175,7 @@ class SettingsDialog(QDialog):
         self.config_manager.set("LANGUAGE", self.lang_combo.currentData())
         self.config_manager.set("PROMPT", self.prompt_edit.text())
         self.config_manager.set("OFFSET", self.offset_spin.value())
+        self.config_manager.set("CALIBRATION_THRESHOLD", self.calibration_spin.value())
         
         self.config_manager.set("MODEL_DIR", self.model_path_edit.text())
         self.config_manager.set("OUTPUT_DIR", self.output_path_edit.text())

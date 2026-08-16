@@ -4,38 +4,17 @@ import re
 import gc
 import torch
 import traceback
+import time
 import stable_whisper
 from multiprocessing import Queue, Event
-from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
 
-from config import MIN_DURATION
+
 from core.lrc_parser import LrcParser
-from core.lrc_aligner import LrcAligner
-from utils.time_utils import format_time
-from utils.logger import setup_logger
+from core.lrc_aligner_v2 import LrcAligner
 
-try:
-    import faster_whisper
-    HAS_FASTER_WHISPER = True
-except ImportError:
-    HAS_FASTER_WHISPER = False
+from utils.logger_v2 import setup_logger
 
-@dataclass
-class WorkerArgs:
-    audio_path: str
-    model_size: str
-    language: str
-    ref_text: str
-    lrc_parser_data: Dict[str, Any]
-    time_offset: float
-    initial_prompt_input: str
-    model_dir: str = None
-    release_vram: bool = True
-    lrc_timestamps: List[float] = field(default_factory=list) # 传递行时间戳列表
-    enable_force_calibration: bool = True
-    enable_avg_distribution: bool = False
-
+from core.worker_types import WorkerArgs
 def get_attr(obj, key, default=None):
     if isinstance(obj, dict): return obj.get(key, default)
     return getattr(obj, key, default)
@@ -60,6 +39,8 @@ class ModelCache:
     
     def set(self, model, model_size):
         """设置缓存的模型"""
+        if model is None:
+            return
         self.model = model
         self.model_size = model_size
         self.logger.info(f"Model cached: {model_size}")
@@ -126,7 +107,7 @@ def daemon_worker(input_queue: Queue, result_queue: Queue, progress_queue: Queue
         except Exception as e:
             logger.error(f"Daemon loop error: {traceback.format_exc()}")
             # 防止死循环，稍作休眠
-            import time
+            # time 已在模块顶部导入
             time.sleep(1)
 
 def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Queue, stop_event: Event):
@@ -171,7 +152,7 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
         
         is_cuda = torch.cuda.is_available()
         device = "cuda" if is_cuda else "cpu"
-        progress_queue.put(f"⚙️ 运行设备: {device.upper()}")
+        progress_queue.put(f"运行设备: {device.upper()}")
         logger.info(f"Device: {device}")
 
         model = None
@@ -180,49 +161,24 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
         if _model_cache.is_cached(model_size):
             logger.info("Using cached model.")
             model, _ = _model_cache.get()
-            progress_queue.put(f"⚡ 使用缓存模型 ({model_size})")
+            progress_queue.put(f"使用缓存模型 ({model_size})")
         else:
             cached_model, cached_size = _model_cache.get()
             if cached_model:
                 logger.info(f"Model mismatch (cached: {cached_size}, req: {model_size}). Clearing cache.")
-                progress_queue.put("🔄 切换模型中，释放旧模型显存...")
+                progress_queue.put("切换模型中，释放旧模型显存...")
                 _model_cache.clear(force=True)
         
-        # 加载新模型
+        # 加载新模型（原版 OpenAI Whisper，stable-whisper 封装）
         if not model:
             try:
-                use_faster = False
-                if HAS_FASTER_WHISPER and not stop_event.is_set():
-                    progress_queue.put(f"🚀 加载 Faster-Whisper ({model_size})...")
-                    progress_queue.put("PROGRESS:10")
-                    try:
-                        # 尝试使用本地下载的模型路径
-                        faster_whisper_path = os.path.join(local_model_path, f"faster-whisper-{model_size}")
-                        if os.path.exists(faster_whisper_path):
-                            logger.info(f"Loading from local path: {faster_whisper_path}")
-                            model = stable_whisper.load_faster_whisper(
-                                faster_whisper_path, device=device,
-                                compute_type="float16" if device=="cuda" else "int8"
-                            )
-                        else:
-                            # 回退到原始逻辑，让 stable_whisper 自动下载
-                            logger.info(f"Local model not found, falling back to auto-download")
-                            model = stable_whisper.load_faster_whisper(
-                                model_size, download_root=local_model_path, device=device,
-                                compute_type="float16" if device=="cuda" else "int8"
-                            )
-                        use_faster = True
-                    except Exception as fw_error:
-                        logger.warning(f"Faster-Whisper load failed: {fw_error}")
-                        model = None
-                
-                if not model and not stop_event.is_set():
-                    progress_queue.put(f"加载标准模型 ({model_size})...")
+                if not stop_event.is_set():
+                    progress_queue.put(f"加载模型 ({model_size})...")
                     progress_queue.put("PROGRESS:10")
                     model = stable_whisper.load_model(model_size, download_root=local_model_path, device=device)
-                
+
                 # 更新缓存
-                if not release_vram_flag:
+                if model is not None and not release_vram_flag:
                     _model_cache.set(model, model_size)
                     
             except Exception as e:
@@ -254,16 +210,13 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
             
             # 只有当确实已经下载了 VAD 模型或者网络环境允许时才建议开启 vad=True
             # result = model.align(audio_path, spaced_ref_text, **align_args)
-            
-            # 如果是 faster-whisper，align 方法参数可能略有不同，但 stable-whisper 做了封装
+
             result = model.align(audio_path, spaced_ref_text, **align_args)
         else:
             progress_queue.put("正在进行语音识别...")
             transcribe_args = {"language": lang_param, "word_timestamps": True, "vad": True, "regroup": False}
             if initial_prompt_input and initial_prompt_input.strip():
                 transcribe_args["initial_prompt"] = initial_prompt_input.strip()
-            if hasattr(model, "model") and "FasterWhisper" in str(type(model.model)): # Check if faster whisper
-                 transcribe_args["beam_size"] = 5
             
             result = model.transcribe(audio_path, **transcribe_args)
         
@@ -278,7 +231,8 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
             parser, 
             time_offset, 
             enable_force_calibration=args.enable_force_calibration,
-            enable_avg_distribution=args.enable_avg_distribution
+            enable_avg_distribution=args.enable_avg_distribution,
+            calibration_threshold=args.calibration_threshold
         )
         lrc_content = aligner.run(result, stop_event, progress_queue)
         
@@ -291,7 +245,7 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
 
     except torch.cuda.OutOfMemoryError:
         logger.error("OOM Error")
-        result_queue.put(("error", "❌ 显存不足！请尝试更小的模型"))
+        result_queue.put(("error", "显存不足！请尝试更小的模型"))
         _model_cache.clear(force=True)
     except Exception as e:
         if not stop_event.is_set():

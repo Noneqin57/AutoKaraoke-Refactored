@@ -2,26 +2,30 @@
 import os
 import sys
 import time
+import logging
 from multiprocessing import Process, Queue, Event
 from queue import Empty
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
                              QFileDialog, QTextEdit, QProgressBar, QMessageBox, QComboBox, 
-                             QSplitter, QSpinBox, QCheckBox)
-from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QSyntaxHighlighter, QTextCharFormat, QColor
+                             QSplitter, QSpinBox, QCheckBox, QFrame, QGraphicsDropShadowEffect)
+from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent, QSyntaxHighlighter, QTextCharFormat, QColor, QIcon
 from PyQt6.QtCore import Qt, QTimer
+try:
+    import qtawesome as qta
+    HAS_QTAWESOME = True
+except ImportError:
+    qta = None
+    HAS_QTAWESOME = False
 
 from config import TIMEOUT_CHECK_INTERVAL, PROMPT_DEFAULTS, ConfigManager, LANGUAGES
 from core.lrc_parser import LrcParser
 from core.whisper_worker import daemon_worker, WorkerArgs
+from core.worker_policy import decide_worker_recovery
 from ui.editor_dialog import LrcEditorDialog
 from ui.settings_dialog import SettingsDialog
 from ui.model_manager_dialog import ModelManagerDialog
 
-try:
-    import faster_whisper
-    HAS_FASTER_WHISPER = True
-except ImportError:
-    HAS_FASTER_WHISPER = False
+logger = logging.getLogger(__name__)
 
 class LrcHighlighter(QSyntaxHighlighter):
     def __init__(self, document):
@@ -63,6 +67,8 @@ class LyricsGenApp(QMainWindow):
         self.chk_avg_dist = None
         
         self.is_running_task = False # Track actual task status
+        self.pending_retry_args = None
+        self.retry_attempted = False
         
         self.setup_menu()
         self.setup_ui()
@@ -76,7 +82,7 @@ class LyricsGenApp(QMainWindow):
                                           args=(self.task_queue, self.result_queue, self.progress_queue, self.stop_event))
             self.worker_process.daemon = True
             self.worker_process.start()
-            print(f"Daemon worker started with PID: {self.worker_process.pid}")
+            logger.info("Daemon worker started with PID: %s", self.worker_process.pid)
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -90,7 +96,7 @@ class LyricsGenApp(QMainWindow):
             ext = os.path.splitext(f)[1].lower()
             if ext in ['.mp3', '.wav', '.flac', '.m4a', '.ogg']:
                 self.audio_path = f
-                self.path_lbl.setText(f"🎵 {os.path.basename(f)}")
+                self.path_lbl.setText(f"{os.path.basename(f)}")
                 self.status.setText("音频已加载 (通过拖拽)")
                 if self.out_txt.toPlainText().strip(): self.btn_cali.setEnabled(True)
             elif ext in ['.lrc', '.txt', '.srt']:
@@ -152,116 +158,248 @@ class LyricsGenApp(QMainWindow):
         settings_menu.addAction(model_mgr)
 
     def setup_ui(self):
-        self.setStyleSheet("""
-            QMainWindow { background-color: #f5f7fa; }
-            QLabel { font-family: 'Microsoft YaHei'; color: #333; font-size: 13px; }
-            QTextEdit { background: white; border: 1px solid #dcdfe6; border-radius: 6px; padding: 10px; font-family: Consolas; font-size: 14px; }
-            QLineEdit { background: white; border: 1px solid #dcdfe6; border-radius: 4px; padding: 5px; }
-            QPushButton { background-color: #409eff; color: white; border-radius: 6px; padding: 8px 15px; font-weight: bold; }
-            QPushButton:hover { background-color: #66b1ff; }
-            QPushButton:disabled { background-color: #c0c4cc; color: #909399; }
-            QComboBox, QSpinBox { padding: 5px; border: 1px solid #dcdfe6; background: white; border-radius: 4px; }
-            QProgressBar { border: 1px solid #dcdfe6; border-radius: 4px; text-align: center; }
-            QProgressBar::chunk { background-color: #409eff; width: 20px; }
-        """)
-        
+        self.setStyleSheet(self._build_stylesheet())
+
         central = QWidget()
+        central.setObjectName("central")
         self.setCentralWidget(central)
         layout = QVBoxLayout(central)
-        layout.setSpacing(10)
-        
-        status_text = "<span style='color:green'>⚡ 加速模式</span>" if HAS_FASTER_WHISPER else "<span>标准模式</span>"
-        layout.addWidget(QLabel(f"<h2>AutoKaraoke Refactored {status_text}</h2>"), alignment=Qt.AlignmentFlag.AlignCenter)
-        
-        # 文件选择
-        file_box = QHBoxLayout()
-        self.path_lbl = QLabel("🚫 尚未选择音频文件")
-        self.path_lbl.setStyleSheet("background: white; padding: 8px; border: 1px dashed #ccc; border-radius: 4px;")
-        btn_aud = QPushButton("📂 选择歌曲")
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        layout.addWidget(self._build_header())
+        layout.addWidget(self._build_file_card())
+        layout.addWidget(self._build_splitter(), 1)
+        layout.addWidget(self._build_options_card())
+        layout.addWidget(self._build_actions_card())
+        layout.addLayout(self._build_status_bar())
+
+    def _build_stylesheet(self) -> str:
+        """集中管理的现代化样式表（token 化，便于后续扩展暗色主题）。"""
+        return """
+            QMainWindow, QWidget#central { background-color: #f5f7fa; }
+            QLabel { font-family: 'Microsoft YaHei', 'Segoe UI', sans-serif; color: #303133; font-size: 13px; background: transparent; }
+
+            QFrame#card { background-color: #ffffff; border: 1px solid #ebeef5; border-radius: 10px; }
+            QWidget#cardHead { background-color: #fafbfc; border-bottom: 1px solid #ebeef5; border-top-left-radius: 10px; border-top-right-radius: 10px; }
+            QLabel#cardTitle { font-weight: bold; font-size: 13px; color: #303133; }
+
+            QFrame#header { background-color: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #409eff, stop:1 #5b8def); border: none; border-radius: 12px; }
+            QLabel#appTitle { color: #ffffff; font-size: 17px; font-weight: bold; }
+
+            QTextEdit { background: #ffffff; border: 1px solid #dcdfe6; border-radius: 8px; padding: 10px; font-family: Consolas, 'Courier New', monospace; font-size: 14px; selection-background-color: #409eff; selection-color: #ffffff; }
+            QTextEdit:focus { border: 1px solid #409eff; }
+            QFrame#card QTextEdit { border: none; border-bottom-left-radius: 10px; border-bottom-right-radius: 10px; }
+            QFrame#card QTextEdit:focus { border: none; }
+            QFrame#card QTextEdit#outputBox { background-color: #f0f9eb; color: #303133; }
+
+            QPushButton { background-color: #409eff; color: #ffffff; border: none; border-radius: 6px; padding: 8px 16px; font-weight: bold; font-family: 'Microsoft YaHei'; font-size: 13px; }
+            QPushButton:hover { background-color: #66b1ff; }
+            QPushButton:pressed { background-color: #337ecc; }
+            QPushButton:disabled { background-color: #a0cfff; color: #ffffff; }
+            QPushButton#secondary { background-color: #ffffff; color: #f56c6c; border: 1px solid #fbc4c4; }
+            QPushButton#secondary:hover { background-color: #fef0f0; }
+            QPushButton#secondary:pressed { background-color: #fde2e2; }
+            QPushButton#secondary:disabled { background-color: #ffffff; color: #c0c4cc; border-color: #e4e7ed; }
+            QPushButton#warning { background-color: #e6a23c; }
+            QPushButton#warning:hover { background-color: #ebb563; }
+            QPushButton#warning:pressed { background-color: #cf9236; }
+            QPushButton#danger { background-color: #f56c6c; }
+            QPushButton#danger:hover { background-color: #f78989; }
+            QPushButton#danger:pressed { background-color: #dd6161; }
+            QPushButton#info { background-color: #909399; }
+            QPushButton#info:hover { background-color: #a6a9ad; }
+            QPushButton#info:disabled { background-color: #c8c9cc; }
+
+            QLineEdit, QComboBox, QSpinBox { background: #ffffff; border: 1px solid #dcdfe6; border-radius: 6px; padding: 5px 8px; font-family: 'Microsoft YaHei'; }
+            QComboBox:hover, QSpinBox:hover { border-color: #c0c4cc; }
+            QComboBox:focus, QSpinBox:focus { border-color: #409eff; }
+            QComboBox::drop-down { border: none; width: 22px; }
+
+            QProgressBar { border: none; border-radius: 4px; background-color: #ebeef5; text-align: center; }
+            QProgressBar::chunk { background-color: #409eff; border-radius: 4px; }
+
+            QCheckBox { spacing: 6px; color: #606266; font-family: 'Microsoft YaHei'; }
+            QCheckBox::indicator { width: 16px; height: 16px; border: 1px solid #dcdfe6; border-radius: 4px; background: #ffffff; }
+            QCheckBox::indicator:hover { border-color: #409eff; }
+            QCheckBox::indicator:checked { background-color: #409eff; border-color: #409eff; }
+            QCheckBox::indicator:disabled { background-color: #f5f7fa; border-color: #e4e7ed; }
+
+            QSplitter::handle { background-color: #f5f7fa; width: 8px; }
+        """
+
+    def _make_card(self, shadow: bool = True) -> QFrame:
+        """创建带圆角（可选阴影）的卡片容器。"""
+        card = QFrame()
+        card.setObjectName("card")
+        card.setFrameShape(QFrame.Shape.NoFrame)
+        if shadow:
+            effect = QGraphicsDropShadowEffect(card)
+            effect.setBlurRadius(16)
+            effect.setOffset(0, 2)
+            effect.setColor(QColor(31, 35, 41, 14))
+            card.setGraphicsEffect(effect)
+        return card
+
+    @staticmethod
+    def _icon(name: str, color: str = "#ffffff"):
+        """生成 qtawesome 矢量图标（默认白色，用于实心按钮）。若未安装则降级为空图标。"""
+        if not HAS_QTAWESOME:
+            return QIcon()
+        return qta.icon(name, color=color)
+
+    def _build_header(self) -> QFrame:
+        header = QFrame()
+        header.setObjectName("header")
+        header.setFixedHeight(56)
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(18, 0, 18, 0)
+
+        title = QLabel("AutoKaraoke Refactored")
+        title.setObjectName("appTitle")
+        lay.addWidget(title)
+        lay.addStretch()
+        return header
+
+    def _build_file_card(self) -> QFrame:
+        card = self._make_card()
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(16, 10, 16, 10)
+
+        self.path_lbl = QLabel("尚未选择音频文件")
+        self.path_lbl.setStyleSheet("color: #909399;")
+        btn_aud = QPushButton("选择歌曲")
+        btn_aud.setIcon(self._icon("fa5s.folder-open"))
+        btn_aud.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_aud.clicked.connect(self.select_audio)
-        file_box.addWidget(self.path_lbl, 4)
-        file_box.addWidget(btn_aud, 1)
-        layout.addLayout(file_box)
-        
-        # 分割区域
+
+        lay.addWidget(self.path_lbl, 1)
+        lay.addWidget(btn_aud)
+        return card
+
+    def _build_splitter(self) -> QSplitter:
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        
-        # 左侧输入
-        left = QWidget()
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
+
+        # 左侧：歌词底稿
+        left = self._make_card(shadow=False)
         l_lay = QVBoxLayout(left)
-        h_lay = QHBoxLayout()
-        h_lay.addWidget(QLabel("<b>📝 歌词底稿</b>"))
-        btn_imp = QPushButton("📂 导入 LRC/TXT")
-        btn_imp.setStyleSheet("background:#e6a23c; color: white;")
+        l_lay.setContentsMargins(0, 0, 0, 0)
+        l_lay.setSpacing(0)
+
+        l_head = QWidget()
+        l_head.setObjectName("cardHead")
+        lh = QHBoxLayout(l_head)
+        lh.setContentsMargins(16, 8, 12, 8)
+        lt = QLabel("歌词底稿")
+        lt.setObjectName("cardTitle")
+        lh.addWidget(lt)
+        lh.addStretch()
+        btn_imp = QPushButton("导入")
+        btn_imp.setObjectName("warning")
+        btn_imp.setIcon(self._icon("fa5s.file-import"))
+        btn_imp.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_imp.clicked.connect(self.import_lrc)
-        btn_clr = QPushButton("🗑️ 清空")
-        btn_clr.setStyleSheet("background:#f56c6c; color: white;")
+        btn_clr = QPushButton("清空")
+        btn_clr.setObjectName("danger")
+        btn_clr.setIcon(self._icon("fa5s.trash-alt"))
+        btn_clr.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_clr.clicked.connect(self.clear_input)
-        h_lay.addWidget(btn_imp)
-        h_lay.addWidget(btn_clr)
-        h_lay.addStretch()
-        l_lay.addLayout(h_lay)
+        lh.addWidget(btn_imp)
+        lh.addWidget(btn_clr)
+        l_lay.addWidget(l_head)
+
         self.input_txt = QTextEdit()
         self.input_txt.setPlaceholderText("在此粘贴包含时间戳的LRC...\n第一行为原文，后续相同时间戳的行为翻译。")
         self.highlighter = LrcHighlighter(self.input_txt.document())
         l_lay.addWidget(self.input_txt)
         splitter.addWidget(left)
-        
-        # 右侧输出
-        right = QWidget()
+
+        # 右侧：生成结果
+        right = self._make_card(shadow=False)
         r_lay = QVBoxLayout(right)
-        r_head_lay = QHBoxLayout()
-        r_head_lay.addWidget(QLabel("<b>✅ 生成结果</b>"))
-        self.btn_cali = QPushButton("🛠️ 手动校准/编辑")
-        self.btn_cali.setStyleSheet("background: #909399; color: white;")
+        r_lay.setContentsMargins(0, 0, 0, 0)
+        r_lay.setSpacing(0)
+
+        r_head = QWidget()
+        r_head.setObjectName("cardHead")
+        rh = QHBoxLayout(r_head)
+        rh.setContentsMargins(16, 8, 12, 8)
+        rt = QLabel("生成结果")
+        rt.setObjectName("cardTitle")
+        rh.addWidget(rt)
+        rh.addStretch()
+        self.btn_cali = QPushButton("手动校准/编辑")
+        self.btn_cali.setObjectName("info")
+        self.btn_cali.setIcon(self._icon("fa5s.edit"))
+        self.btn_cali.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_cali.clicked.connect(self.open_calibration)
         self.btn_cali.setEnabled(False)
-        r_head_lay.addStretch()
-        r_head_lay.addWidget(self.btn_cali)
-        r_lay.addLayout(r_head_lay)
+        rh.addWidget(self.btn_cali)
+        r_lay.addWidget(r_head)
+
         self.out_txt = QTextEdit()
-        self.out_txt.setStyleSheet("background:#f0f9eb; color: #333;")
+        self.out_txt.setObjectName("outputBox")
         self.out_txt.setReadOnly(True)
         r_lay.addWidget(self.out_txt)
         splitter.addWidget(right)
-        layout.addWidget(splitter, 1)
-        
-        # 选项控制
-        opt_lay = QHBoxLayout()
+
+        splitter.setSizes([520, 520])
+        return splitter
+
+    def _build_options_card(self) -> QFrame:
+        card = self._make_card()
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(16, 8, 16, 8)
+
         self.chk_force_cali = QCheckBox("启用强制校准")
         self.chk_force_cali.setChecked(True)
         self.chk_force_cali.setToolTip("当生成的时间戳与原始时间戳偏差过大时，强制对齐到原始时间戳")
-        
+
         self.chk_avg_dist = QCheckBox("校准行平均分配时间")
         self.chk_avg_dist.setChecked(False)
         self.chk_avg_dist.setToolTip("仅在触发强制校准时生效：将该行的时间平均分配给每个字，便于后续手动微调")
-        
-        opt_lay.addWidget(self.chk_force_cali)
-        opt_lay.addWidget(self.chk_avg_dist)
-        opt_lay.addStretch()
-        layout.addLayout(opt_lay)
-        
-        # 底部控制
-        btm = QHBoxLayout()
-        self.btn_run = QPushButton("🚀 开始生成")
-        self.btn_run.clicked.connect(self.start)
+
+        lay.addWidget(self.chk_force_cali)
+        lay.addWidget(self.chk_avg_dist)
+        lay.addStretch()
+        return card
+
+    def _build_actions_card(self) -> QFrame:
+        card = self._make_card()
+        lay = QHBoxLayout(card)
+        lay.setContentsMargins(16, 12, 16, 12)
+
+        self.btn_run = QPushButton("开始生成")
+        self.btn_run.setIcon(self._icon("fa5s.play"))
         self.btn_run.setMinimumHeight(40)
-        self.btn_stop = QPushButton("⏹️ 停止")
-        self.btn_stop.setStyleSheet("background:#f56c6c; color: white;")
+        self.btn_run.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_run.clicked.connect(self.start)
+
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setObjectName("secondary")
+        self.btn_stop.setIcon(self._icon("fa5s.stop", "#f56c6c"))
+        self.btn_stop.setMinimumHeight(40)
+        self.btn_stop.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_stop.clicked.connect(self.stop)
         self.btn_stop.setEnabled(False)
-        self.btn_stop.setMinimumHeight(40)
-        btm.addWidget(self.btn_run, 2)
-        btm.addWidget(self.btn_stop, 1)
-        layout.addLayout(btm)
-        
-        # 状态栏
+
+        lay.addWidget(self.btn_run, 3)
+        lay.addWidget(self.btn_stop, 1)
+        return card
+
+    def _build_status_bar(self) -> QHBoxLayout:
         stat = QHBoxLayout()
+        stat.setContentsMargins(4, 0, 4, 0)
+
         self.status = QLabel("就绪")
+        self.status.setStyleSheet("color: #909399;")
         self.pbar = QProgressBar()
         self.pbar.setTextVisible(False)
-        self.pbar.setMaximumHeight(10)
+        self.pbar.setFixedSize(220, 8)
         self.pbar.hide()
+
         stat.addWidget(self.status)
         stat.addWidget(self.pbar)
         stat.addStretch()
@@ -269,10 +407,12 @@ class LyricsGenApp(QMainWindow):
         self.enc_combo = QComboBox()
         self.enc_combo.addItems(["utf-8", "gbk", "utf-8-sig"])
         stat.addWidget(self.enc_combo)
-        btn_save = QPushButton("💾 保存结果")
+        btn_save = QPushButton("保存结果")
+        btn_save.setIcon(self._icon("fa5s.save"))
+        btn_save.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_save.clicked.connect(self.save)
         stat.addWidget(btn_save)
-        layout.addLayout(stat)
+        return stat
 
     def open_settings_dialog(self):
         dialog = SettingsDialog(self.config_manager, self)
@@ -283,8 +423,24 @@ class LyricsGenApp(QMainWindow):
         dialog.exec()
 
     def check_queue(self):
-        # 移除进程存活检查，因为是常驻进程
-        # if self.worker_process and not self.worker_process.is_alive(): ... 
+        # 常驻进程崩溃检测：自动重启并重试一次，仍失败则报错
+        if self.worker_process is not None and not self.worker_process.is_alive():
+            action = decide_worker_recovery(
+                self.is_running_task,
+                self.pending_retry_args is not None,
+                self.retry_attempted,
+            )
+            if action == "retry":
+                self.retry_attempted = True
+                self.status.setText("后台进程已重启，正在自动重试当前任务...")
+                self.init_worker()
+                self.task_queue.put(self.pending_retry_args)
+                return
+            if action == "error":
+                self.on_error("后台处理进程意外退出，请重试")
+            self.cleanup_worker()
+            self.init_worker()
+            return
         
         while True:
             try:
@@ -313,7 +469,7 @@ class LyricsGenApp(QMainWindow):
         f, _ = QFileDialog.getOpenFileName(self, "选择音频", "", "Audio Files (*.mp3 *.wav *.flac *.m4a *.ogg)")
         if f:
             self.audio_path = f
-            self.path_lbl.setText(f"🎵 {os.path.basename(f)}")
+            self.path_lbl.setText(f"{os.path.basename(f)}")
             self.status.setText("音频已加载")
             if self.out_txt.toPlainText().strip(): self.btn_cali.setEnabled(True)
 
@@ -331,11 +487,12 @@ class LyricsGenApp(QMainWindow):
         if not self.audio_path: return QMessageBox.warning(self, "提示", "请先选择音频文件")
         
         # 从配置中读取参数
-        model_size = self.config_manager.get("MODEL_SIZE", "large-v2")
-        lang_code = self.config_manager.get("LANGUAGE", "ja")
-        prompt = self.config_manager.get("PROMPT", "")
-        offset_ms = self.config_manager.get("OFFSET", 0)
-        release_vram = self.config_manager.get("RELEASE_VRAM", True)
+        model_size = self.config_manager.get("MODEL_SIZE") or "large-v2"
+        lang_code = self.config_manager.get("LANGUAGE") or "ja"
+        prompt = self.config_manager.get("PROMPT") or ""
+        offset_ms = self.config_manager.get("OFFSET") or 0
+        release_vram = self.config_manager.get("RELEASE_VRAM", True) is not False
+        calibration_threshold = self.config_manager.get("CALIBRATION_THRESHOLD") or 1.5
         
         # 验证语言设置 (如果prompt是默认值，则根据语言自动更新)
         # 这里实际上我们在SettingsDialog里已经处理了Prompt的联动，所以直接用即可。
@@ -366,9 +523,9 @@ class LyricsGenApp(QMainWindow):
                 # 内容匹配，说明用户没有修改歌词文本，可以使用原始时间戳
                 current_timestamps = temp_parser.lines_timestamps
                 used_raw_content = True
-                print("Using cached raw LRC content for timestamps.")
+                logger.info("Using cached raw LRC content for timestamps.")
             else:
-                print("Cached content mismatch. Fallback to input text.")
+                logger.info("Cached content mismatch. Fallback to input text.")
                 # Debug info
                 # print(f"Cached len: {len(normalize(temp_clean))}, Input len: {len(normalize(txt))}")
                 
@@ -380,7 +537,7 @@ class LyricsGenApp(QMainWindow):
             # 注意：如果输入框里没有时间戳，这里解析出的 timestamps 全是 -1
             self.lrc_parser.parse(txt, ".lrc")
             current_timestamps = self.lrc_parser.lines_timestamps
-            print("Parsed content from input text box.")
+            logger.info("Parsed content from input text box.")
         
         lrc_parser_data = {
             'headers': self.lrc_parser.headers, 
@@ -428,8 +585,13 @@ class LyricsGenApp(QMainWindow):
             release_vram=release_vram,
             lrc_timestamps=current_timestamps, # 传递时间戳
             enable_force_calibration=self.chk_force_cali.isChecked(),
-            enable_avg_distribution=self.chk_avg_dist.isChecked()
+            enable_avg_distribution=self.chk_avg_dist.isChecked(),
+            calibration_threshold=calibration_threshold
+
         )
+
+        self.pending_retry_args = args
+        self.retry_attempted = False
 
         # 确保后台进程已启动
         self.init_worker()
@@ -454,24 +616,29 @@ class LyricsGenApp(QMainWindow):
 
     def on_done(self, lrc: str):
         self.is_running_task = False
+        self.pending_retry_args = None
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.btn_cali.setEnabled(True)
         self.pbar.hide()
         self.out_txt.setText(lrc)
-        self.status.setText("✅ 任务完成")
+        self.status.setText("任务完成")
 
     def on_aborted(self):
+        self.is_running_task = False
+        self.pending_retry_args = None
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.pbar.hide()
-        self.status.setText("🛑 任务已停止")
+        self.status.setText("任务已停止")
 
     def on_error(self, error_msg: str):
+        self.is_running_task = False
+        self.pending_retry_args = None
         self.btn_run.setEnabled(True)
         self.btn_stop.setEnabled(False)
         self.pbar.hide()
-        self.status.setText("❌ 任务失败")
+        self.status.setText("任务失败")
         QMessageBox.critical(self, "错误", error_msg)
 
     def open_calibration(self):
@@ -483,7 +650,7 @@ class LyricsGenApp(QMainWindow):
         if dialog.exec():
             if dialog.result_lrc:
                 self.out_txt.setText(dialog.result_lrc)
-                self.status.setText("✅ 校准已应用")
+                self.status.setText("校准已应用")
 
     def save(self):
         txt = self.out_txt.toPlainText()
@@ -501,10 +668,27 @@ class LyricsGenApp(QMainWindow):
         if f:
             try:
                 with open(f, 'w', encoding=self.enc_combo.currentText()) as file: file.write(txt)
-                self.status.setText(f"💾 已保存: {os.path.basename(f)}")
+                self.status.setText(f"已保存: {os.path.basename(f)}")
             except Exception as e:
                 QMessageBox.critical(self, "保存失败", str(e))
 
+    def _shutdown_worker(self, timeout: float = 3.0):
+        """优雅关闭常驻 worker 进程；超时则强制终止。"""
+        if not self.worker_process or not self.worker_process.is_alive():
+            return
+        try:
+            self.task_queue.put("EXIT")
+        except Exception:
+            logger.exception("Failed to send EXIT to worker queue")
+
+        self.worker_process.join(timeout=timeout)
+        if self.worker_process.is_alive():
+            logger.warning("Worker process did not exit gracefully; terminating.")
+            self.worker_process.terminate()
+            self.worker_process.join(timeout=1)
+            if self.worker_process.is_alive():
+                self.worker_process.kill()
+                self.worker_process.join(timeout=1)
     def closeEvent(self, event):
         if self.is_running_task: # 仅当任务实际运行时提示
             reply = QMessageBox.question(self, '确认退出', '后台任务正在运行，确定要退出吗？', 
@@ -518,8 +702,6 @@ class LyricsGenApp(QMainWindow):
 
         # 关闭常驻进程
         if self.worker_process and self.worker_process.is_alive():
-            self.task_queue.put("EXIT")
-            # 给他一点时间退出
-            time.sleep(0.1)
+            self._shutdown_worker()
             
         event.accept()

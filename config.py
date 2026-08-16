@@ -1,33 +1,19 @@
 # -*- coding: utf-8 -*-
-"""
-REATK - AutoKaraoke Refactored
-Copyright (C) 2024
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
-
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-GNU General Public License for more details.
-
-You should have received a copy of the GNU General Public License
-along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""
+import logging
 import os
 import json
 from threading import Lock
-from typing import Any, Optional
+from typing import Any
 
 # 镜像源配置
-os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+logger = logging.getLogger(__name__)
 
 # 常量配置
 MIN_DURATION = 0.06  # 最小时间间隔（秒）
 SEARCH_WINDOW = 20   # 搜索窗口大小
 TIMEOUT_CHECK_INTERVAL = 0.5  # 超时检查间隔（秒）
+CALIBRATION_THRESHOLD = 1.5  # 强制校准触发阈值（秒）
 
 # 完整语言列表 (Whisper支持的主要语言)
 LANGUAGES = {
@@ -80,8 +66,8 @@ class ConfigManager:
                     with open(self.config_file, 'r', encoding='utf-8') as f:
                         self.config = json.load(f)
                 except (json.JSONDecodeError, IOError, UnicodeDecodeError) as e:
-                    print(f"Warning: Failed to load config file: {e}. Using default config.")
-                    self.config = {}
+                    logger.warning("Failed to load config file: %s. Using default config.", e)
+                    self.config = self._get_default_config()
             else:
                 self.config = self._get_default_config()
 
@@ -89,6 +75,8 @@ class ConfigManager:
         """保存配置到文件"""
         with self._lock:
             try:
+                directory = os.path.dirname(self.config_file) or "."
+                os.makedirs(directory, exist_ok=True)
                 # 创建临时文件，避免写入失败导致配置丢失
                 temp_file = self.config_file + '.tmp'
                 with open(temp_file, 'w', encoding='utf-8') as f:
@@ -101,13 +89,13 @@ class ConfigManager:
                     os.rename(temp_file, self.config_file)
                     
             except Exception as e:
-                print(f"Failed to save config: {e}")
+                logger.error("Failed to save config: %s", e)
                 # 清理临时文件
                 if os.path.exists(temp_file):
                     try:
                         os.remove(temp_file)
                     except OSError as cleanup_error:
-                        print(f"Failed to cleanup temp file: {cleanup_error}")
+                        logger.error("Failed to cleanup temp file: %s", cleanup_error)
 
     def get(self, key: str, default: Any = None) -> Any:
         """获取配置项
@@ -136,7 +124,7 @@ class ConfigManager:
         """批量更新配置
         
         Args:
-            updates: 配置字典
+            updates: 更新字典
         """
         with self._lock:
             self.config.update(updates)
@@ -152,8 +140,8 @@ class ConfigManager:
             "LANGUAGE": "ja",
             "PROMPT": "",
             "OFFSET": 0,
+            "CALIBRATION_THRESHOLD": 1.5,
             "RELEASE_VRAM": True,
-            "MODEL_DIR": None,
-            "OUTPUT_DIR": None,
-            "HF_MIRROR": "https://hf-mirror.com"
+            "MODEL_DIR": "./models",
+            "OUTPUT_DIR": ""
         }

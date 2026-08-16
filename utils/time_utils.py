@@ -2,6 +2,13 @@
 """时间格式化工具模块"""
 from functools import lru_cache
 
+def _format_total_ms(total_ms: int) -> str:
+    """把总毫秒数格式化为 mm:ss.mmm（自动处理 60s/60min 进位）。"""
+    total_ms = max(0, total_ms)
+    minutes, remainder = divmod(total_ms, 60000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
 
 def format_ms(ms: float) -> str:
     """格式化毫秒为 mm:ss.mmm
@@ -12,11 +19,11 @@ def format_ms(ms: float) -> str:
     Returns:
         格式化的时间字符串
     """
-    seconds = ms / 1000.0
-    minutes = int(seconds // 60)
-    secs = int(seconds % 60)
-    milliseconds = int((seconds % 1) * 1000)
-    return f"{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+    return _format_total_ms(round(float(ms)))
+
+
+
+
 
 
 def parse_time_tag(tag: str) -> int:
@@ -37,12 +44,12 @@ def parse_time_tag(tag: str) -> int:
         
         # 分割分:秒
         parts = clean.split(':')
-        if len(parts) != 2:
+        if len(parts) not in (2, 3):
             return -1
             
         minutes = int(parts[0])
         # 处理秒和毫秒（支持 . 和 : 两种分隔符）
-        seconds_str = parts[1].replace(':', '.')
+        seconds_str = parts[1].replace(':', '.') if len(parts) == 2 else f"{parts[1]}.{parts[2]}"
         seconds = float(seconds_str)
         
         # 转换为毫秒
@@ -67,10 +74,10 @@ def format_time(seconds: float, time_offset: float = 0) -> str:
         格式化的时间字符串 mm:ss.mmm
     """
     final_sec = max(0.0, float(seconds) + float(time_offset))
-    minutes = int(final_sec // 60)
-    secs = int(final_sec % 60)
-    milliseconds = int((final_sec % 1) * 1000)
-    return f"{minutes:02d}:{secs:02d}.{milliseconds:03d}"
+    return _format_total_ms(round(final_sec * 1000))
+
+
+
 
 
 def seconds_to_ms(seconds: float) -> int:
@@ -82,7 +89,7 @@ def seconds_to_ms(seconds: float) -> int:
     Returns:
         毫秒数
     """
-    return int(seconds * 1000)
+    return int(round(seconds * 1000))
 
 
 def ms_to_seconds(milliseconds: int) -> float:

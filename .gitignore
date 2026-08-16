@@ -31,8 +31,17 @@ settings.json
 # Temporary files
 *.tmp
 *.temp
-
+.omo/
+.workbuddy/
+.github/
 build/
 plan/
 LRC/
-LRC/カタオモイ - Aimer.lrc
+
+# Python testing / packaging
+.pytest_cache/
+htmlcov/
+.coverage
+*.egg-info/
+dist/
+AGENTS.md

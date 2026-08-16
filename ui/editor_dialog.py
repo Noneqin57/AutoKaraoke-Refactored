@@ -41,7 +41,7 @@ class LrcEditorDialog(QDialog):
         layout = QVBoxLayout(self)
         
         help_lbl = QLabel(
-            "💡 <b>操作：</b>单击暂停选中 | 双击跳转 | Enter键同步当前行 | 空格播放/暂停"
+            "<b>操作：</b>单击暂停选中 | 双击跳转 | Enter键同步当前行 | 空格播放/暂停"
         )
         help_lbl.setStyleSheet("background: #e6f7ff; padding: 10px; border: 1px solid #91d5ff;")
         layout.addWidget(help_lbl)
@@ -50,7 +50,7 @@ class LrcEditorDialog(QDialog):
         preview_container = QVBoxLayout()
         preview_container.setSpacing(5)
         
-        lbl_hint = QLabel("🎤 当前播放")
+        lbl_hint = QLabel("当前播放")
         lbl_hint.setStyleSheet("color: #909399; font-size: 12px;")
         preview_container.addWidget(lbl_hint)
         
@@ -103,11 +103,11 @@ class LrcEditorDialog(QDialog):
         layout.addLayout(ctrl_box)
         
         btn_box = QHBoxLayout()
-        btn_stamp = QPushButton("⏱️ 智能同步写入 (Enter)")
+        btn_stamp = QPushButton("智能同步写入 (Enter)")
         btn_stamp.setStyleSheet("background: #e6a23c; color: white; font-weight: bold;")
         btn_stamp.clicked.connect(self.stamp_current_time)
         
-        btn_save = QPushButton("💾 保存并关闭")
+        btn_save = QPushButton("保存并关闭")
         btn_save.setStyleSheet("background: #67c23a; color: white; font-weight: bold;")
         btn_save.clicked.connect(self.save_lrc) 
         
@@ -154,8 +154,6 @@ class LrcEditorDialog(QDialog):
                 # 检测翻译行（时间戳相同且不是第一次出现）
                 if timestamp == last_timestamp and row > 0:
                     self.translation_rows.add(row)
-                    # 翻译行添加图标标记
-                    content = f"🌐 {content}"
                 
                 self.table.setItem(row, 0, QTableWidgetItem(timestamp))
                 self.table.setItem(row, 1, QTableWidgetItem(content))
@@ -545,9 +543,7 @@ class LrcEditorDialog(QDialog):
                 trans_time_item = self.table.item(row, 0)
                 trans_text_item = self.table.item(row, 1)
                 if trans_time_item and trans_text_item and trans_time_item.text() == original_timestamp:
-                    # 移除翻译标记图标
-                    trans_text = trans_text_item.text().replace("🌐 ", "")
-                    translations.append(trans_text)
+                    translations.append(trans_text_item.text())
         
         # 渲染预览
         if '[' in line_text and ']' in line_text and re.search(r'\[\d{2}:\d{2}\.\d{2,3}\]', line_text):
