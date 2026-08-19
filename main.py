@@ -6,7 +6,6 @@ AutoKaraoke Refactored
 import multiprocessing
 import sys
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import Qt
 
 from ui.main_window import LyricsGenApp
 
@@ -16,13 +15,6 @@ def main():
     # 支持 PyInstaller 等打包后运行 multiprocessing（Windows spawn）
     multiprocessing.freeze_support()
     app = QApplication(sys.argv)
-    
-    # 高DPI支持
-    try:
-        app.setAttribute(Qt.ApplicationAttribute.AA_UseHighDpiPixmaps)
-        app.setAttribute(Qt.ApplicationAttribute.AA_EnableHighDpiScaling)
-    except AttributeError:
-        pass
     
     # 创建并显示主窗口
     window = LyricsGenApp()

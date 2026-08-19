@@ -1,30 +1,42 @@
 # -*- coding: utf-8 -*-
+"""
+字级精细打轴编辑器 (WordLevelEditor)
+支持精准波形级定位、单句循环播放、Undo/Redo 历史记录与全键盘快捷工作流。
+"""
 import re
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, 
-                             QComboBox, QTableWidget, QTableWidgetItem, QAbstractItemView)
+                             QComboBox, QTableWidget, QTableWidgetItem, QAbstractItemView,
+                             QCheckBox, QFrame)
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+from PyQt6.QtGui import QUndoStack, QColor, QFont
 
 from utils.time_utils import format_ms, parse_time_tag
+from ui.components.clickable_slider import ClickableSlider
+from ui.components.waveform_widget import WaveformWidget
+from ui.commands.lrc_commands import WordTimestampCommand
+from ui.styles.theme_manager import theme_manager
 
 class WordLevelEditor(QDialog):
     """
-    字级精细校对窗口 (支持区间播放与自动暂停)
+    字级精细校对窗口 (支持区间播放、单句循环与完整撤销重做)
     """
     def __init__(self, audio_path, line_text, start_time_ms, end_time_ms, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("逐字精细打轴 (Enter: 打点 | Space: 播放 | ←/→: 移动)")
-        self.resize(1000, 450)
+        self.setWindowTitle("逐字精细打轴 - AutoKaraoke Editor")
+        self.resize(1080, 560)
         self.audio_path = audio_path
         self.line_text = line_text
         self.base_time = start_time_ms
-        self.end_time_ms = end_time_ms  # 记录本句结束时间
+        self.end_time_ms = end_time_ms
         self.result_text = None
         self.result_lrc_content = None
         self.result_start_time = None
         
+        self.undo_stack = QUndoStack(self)
         self.tokens = self.parse_line(line_text, start_time_ms)
         self.last_active_idx = -1
+        self.loop_playback = False
         
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
@@ -32,25 +44,21 @@ class WordLevelEditor(QDialog):
         self.player.mediaStatusChanged.connect(self.on_media_status_changed)
         self.player.setSource(QUrl.fromLocalFile(audio_path))
         
-        # 初始定位到该句开始前 1秒 (稍微留点预卷时间)
+        # 初始定位到该句开始前 1秒 (留出预卷时间)
         self.start_pos = max(0, self.tokens[0]['time'] - 1000 if self.tokens else start_time_ms - 1000)
         
         self.setup_ui()
         
         self.timer = QTimer(self)
-        self.timer.setInterval(50)
+        self.timer.setInterval(40) # 25fps 丝滑刷新
         self.timer.timeout.connect(self.sync_highlight)
         self.timer.start()
 
     def on_media_status_changed(self, status):
-        if status == QMediaPlayer.MediaStatus.LoadedMedia or status == QMediaPlayer.MediaStatus.BufferedMedia:
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
+            duration = self.player.duration()
+            self.slider.setRange(0, duration)
             self.player.setPosition(self.start_pos)
-
-    def replay_line(self):
-        self.player.setPosition(self.start_pos)
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
-            self.player.play()
-            self.update_play_icon()
 
     def parse_line(self, text, default_start):
         clean_text = re.sub(r'^\[\d{2}:\d{2}\.\d{2,3}\]', '', text)
@@ -58,7 +66,8 @@ class WordLevelEditor(QDialog):
         tokens = []
         current_time = default_start
         for part in parts:
-            if not part: continue
+            if not part:
+                continue
             if re.match(r'^\[\d{2}:\d{2}\.\d{2,3}\]$', part):
                 current_time = parse_time_tag(part)
             else:
@@ -69,66 +78,127 @@ class WordLevelEditor(QDialog):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
         
-        # === 顶部：卡拉OK预览区 ===
-        preview_container = QVBoxLayout()
-        preview_container.setSpacing(5)
+        # === 顶部卡拉OK预览卡片 ===
+        preview_card = QFrame()
+        preview_card.setObjectName("card")
+        preview_card.setStyleSheet(f"""
+            QFrame#card {{
+                background-color: {theme_manager.get_color('bg_preview', '#121316')};
+                border-radius: 10px;
+                padding: 12px;
+            }}
+        """)
+        p_lay = QVBoxLayout(preview_card)
+        p_lay.setContentsMargins(12, 8, 12, 8)
+        p_lay.setSpacing(4)
         
-        lbl_hint = QLabel("实时预览 (Karaoke Preview)")
-        lbl_hint.setStyleSheet("color: #909399; font-size: 12px;")
-        preview_container.addWidget(lbl_hint)
+        top_info = QHBoxLayout()
+        lbl_hint = QLabel("实时逐字卡拉OK预览")
+        lbl_hint.setStyleSheet(f"color: {theme_manager.get_color('text_secondary', '#8c92a4')}; font-size: 11px; font-weight: bold;")
+        range_str = f"当前区间: {format_ms(self.base_time)} -> {format_ms(self.end_time_ms)}"
+        lbl_range = QLabel(range_str)
+        lbl_range.setStyleSheet(f"color: {theme_manager.get_color('accent_primary', '#409eff')}; font-size: 11px; font-weight: bold;")
+        top_info.addWidget(lbl_hint)
+        top_info.addStretch()
+        top_info.addWidget(lbl_range)
+        p_lay.addLayout(top_info)
         
         self.lbl_preview = QLabel()
         self.lbl_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_preview.setStyleSheet("""
-            background-color: #303133; 
-            border-radius: 8px; 
-            padding: 15px;
-            font-family: 'Microsoft YaHei';
-            font-size: 28px;
+            font-family: 'Microsoft YaHei', sans-serif;
+            font-size: 26px;
             font-weight: bold;
+            min-height: 44px;
         """)
         self.lbl_preview.setTextFormat(Qt.TextFormat.RichText)
-        self.update_preview_display(0) # Init
-        preview_container.addWidget(self.lbl_preview)
+        self.update_preview_display(0)
+        p_lay.addWidget(self.lbl_preview)
         
-        layout.addLayout(preview_container)
+        # 单句局部放大波形轨
+        self.waveform = WaveformWidget()
+        self.waveform.load_audio(self.audio_path)
+        zoom_start = max(0, self.base_time - 1000)
+        zoom_end = self.end_time_ms + 1000
+        self.waveform.set_zoom_range(zoom_start, zoom_end)
+        self.waveform.set_highlight_region(self.base_time, self.end_time_ms)
+        self.waveform.set_word_markers([t['time'] for t in self.tokens])
+        self.waveform.seek_requested.connect(self.set_position)
+        p_lay.addWidget(self.waveform)
         
-        # 顶部信息栏
-        info_lay = QHBoxLayout()
-        # 显示当前校对的区间
-        range_str = f"当前区间: {format_ms(self.base_time)} -> {format_ms(self.end_time_ms)}"
-        info_lay.addWidget(QLabel(f"<b>{range_str}</b>"))
-        layout.addLayout(info_lay)
+        layout.addWidget(preview_card)
 
-        # 控制栏
-        top_lay = QHBoxLayout()
-        self.btn_play = QPushButton("播放/暂停 (Space)")
+        # === 播放控制与进度条栏 ===
+        ctrl_card = QFrame()
+        ctrl_card.setObjectName("card")
+        c_lay = QVBoxLayout(ctrl_card)
+        c_lay.setContentsMargins(14, 10, 14, 10)
+        c_lay.setSpacing(8)
+
+        # 进度滑块
+        slider_box = QHBoxLayout()
+        self.lbl_time = QLabel("00:00.000")
+        self.lbl_time.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {theme_manager.get_color('accent_primary', '#409eff')};")
+        self.slider = ClickableSlider(Qt.Orientation.Horizontal)
+        self.slider.sliderMoved.connect(self.set_position)
+        self.slider.clicked_position.connect(self.set_position)
+        
+        slider_box.addWidget(self.lbl_time)
+        slider_box.addWidget(self.slider)
+        c_lay.addLayout(slider_box)
+
+        # 控制按钮行
+        btn_ctrl_row = QHBoxLayout()
+        self.btn_play = QPushButton("播放 (Space)")
         self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_play.clicked.connect(self.toggle_play)
         
-        self.lbl_speed = QLabel("倍速:")
+        self.btn_replay = QPushButton("重播本句 (R)")
+        self.btn_replay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_replay.setObjectName("info")
+        self.btn_replay.clicked.connect(self.replay_line)
+        
+        self.chk_loop = QCheckBox("单句循环 (Loop)")
+        self.chk_loop.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.chk_loop.setChecked(False)
+        self.chk_loop.stateChanged.connect(self.on_loop_changed)
+        
+        lbl_speed = QLabel("倍速:")
         self.combo_speed = QComboBox()
-        self.combo_speed.addItems(["0.25x", "0.5x", "0.75x", "1.0x", "1.25x", "1.5x", "2.0x"])
+        self.combo_speed.addItems(["0.25x", "0.5x", "0.75x", "1.0x", "1.25x", "1.5x"])
         self.combo_speed.setCurrentText("1.0x")
         self.combo_speed.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.combo_speed.currentTextChanged.connect(self.change_speed)
-        
-        self.lbl_time = QLabel("00:00.000")
-        self.lbl_time.setStyleSheet("font-size: 16px; font-weight: bold; color: #409eff;")
-        
-        top_lay.addWidget(self.btn_play)
-        top_lay.addWidget(self.lbl_speed)
-        top_lay.addWidget(self.combo_speed)
-        top_lay.addStretch()
-        top_lay.addWidget(self.lbl_time)
-        layout.addLayout(top_lay)
-        
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) # 确保对话框本身能接收按键
-        
-        # 表格控件
+
+        self.btn_undo = QPushButton("撤销 (Ctrl+Z)")
+        self.btn_undo.setObjectName("info")
+        self.btn_undo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_undo.clicked.connect(self.undo)
+
+        self.btn_redo = QPushButton("重做 (Ctrl+Y)")
+        self.btn_redo.setObjectName("info")
+        self.btn_redo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_redo.clicked.connect(self.redo)
+
+        btn_ctrl_row.addWidget(self.btn_play)
+        btn_ctrl_row.addWidget(self.btn_replay)
+        btn_ctrl_row.addWidget(self.chk_loop)
+        btn_ctrl_row.addSpacing(12)
+        btn_ctrl_row.addWidget(lbl_speed)
+        btn_ctrl_row.addWidget(self.combo_speed)
+        btn_ctrl_row.addStretch()
+        btn_ctrl_row.addWidget(self.btn_undo)
+        btn_ctrl_row.addWidget(self.btn_redo)
+        c_lay.addLayout(btn_ctrl_row)
+
+        layout.addWidget(ctrl_card)
+
+        # === 表格展示区 ===
         self.table = QTableWidget()
-        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # 防止表格抢夺按键焦点
+        self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setRowCount(2)
         self.table.setVerticalHeaderLabels(["歌词", "时间"])
         self.table.setColumnCount(len(self.tokens))
@@ -140,9 +210,7 @@ class WordLevelEditor(QDialog):
         for col, token in enumerate(self.tokens):
             item_char = QTableWidgetItem(token['char'])
             item_char.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            font = item_char.font()
-            font.setPointSize(20)
-            item_char.setFont(font)
+            item_char.setFont(QFont("Microsoft YaHei", 18, QFont.Weight.Bold))
             self.table.setItem(0, col, item_char)
             
             time_str = format_ms(token['time'])
@@ -152,34 +220,30 @@ class WordLevelEditor(QDialog):
             
         self.table.resizeRowsToContents()
         for i in range(self.table.columnCount()):
-            self.table.setColumnWidth(i, 60)
+            self.table.setColumnWidth(i, 65)
             
         self.table.cellClicked.connect(self.on_cell_clicked)
-        layout.addWidget(self.table)
+        layout.addWidget(self.table, 1)
         
-        # 提示信息
-        tips_lay = QHBoxLayout()
-        tips = QLabel("快捷键: [Space]播放/暂停 | [Enter]打点 | [←/→]切换选中 | [↑/↓]微调时间(±50ms) | [Ctrl+Z]撤销")
-        tips.setStyleSheet("color: #606266; font-style: italic;")
-        tips_lay.addWidget(tips)
-        layout.addLayout(tips_lay)
+        # === 快捷键提示条 ===
+        tips = QLabel("快捷键: [Space]播放/暂停 | [Enter]打点并跳下一字 | [←/→]选字 | [↑/↓]微调±50ms | [J/L]步进±500ms | [Ctrl+Z]撤销")
+        tips.setStyleSheet(f"color: {theme_manager.get_color('text_secondary', '#8c92a4')}; font-size: 11px;")
+        layout.addWidget(tips)
         
-        # 底部按钮
+        # === 底部操作栏 ===
         btn_box = QHBoxLayout()
-        btn_replay = QPushButton("重播本句")
-        btn_replay.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_replay.clicked.connect(self.replay_line)
-        
-        btn_save = QPushButton("确认并保存")
+        btn_save = QPushButton("确认并保存 (Ctrl+S)")
         btn_save.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_save.setStyleSheet("background: #67c23a; color: white; font-weight: bold; padding: 10px;")
+        btn_save.setObjectName("success")
+        btn_save.setMinimumHeight(36)
         btn_save.clicked.connect(self.save_and_close)
         
         btn_cancel = QPushButton("取消")
         btn_cancel.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_cancel.setObjectName("secondary")
+        btn_cancel.setMinimumHeight(36)
         btn_cancel.clicked.connect(self.reject)
         
-        btn_box.addWidget(btn_replay)
         btn_box.addStretch()
         btn_box.addWidget(btn_save)
         btn_box.addWidget(btn_cancel)
@@ -188,17 +252,38 @@ class WordLevelEditor(QDialog):
         if self.table.columnCount() > 0:
             self.table.selectColumn(0)
 
+    def on_loop_changed(self, state):
+        self.loop_playback = (state == Qt.CheckState.Checked.value or state == 2)
+
+    def replay_line(self):
+        self.player.setPosition(self.start_pos)
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            self.player.play()
+            self.update_play_button_text()
+
+    def set_position(self, pos):
+        self.player.setPosition(pos)
+        self.slider.setValue(pos)
+        self.waveform.set_position(pos)
+        self.lbl_time.setText(format_ms(pos))
+        self.update_preview_display(pos)
+
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
-            # 如果当前已经播放到了结束时间后面，重新从头播放
             if self.player.position() >= self.end_time_ms:
                 self.player.setPosition(self.start_pos)
             self.player.play()
+        self.update_play_button_text()
+
+    def update_play_button_text(self):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.btn_play.setText("暂停 (Space)")
+        else:
+            self.btn_play.setText("播放 (Space)")
 
     def change_speed(self, text):
-        # "1.0x" -> 1.0
         try:
             val = float(text.replace('x', ''))
             self.player.setPlaybackRate(val)
@@ -206,22 +291,63 @@ class WordLevelEditor(QDialog):
             pass
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Space:
+        key = event.key()
+        modifiers = event.modifiers()
+
+        # 撤销 Ctrl+Z
+        if key == Qt.Key.Key_Z and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            self.undo()
+            return
+        # 重做 Ctrl+Y 或 Ctrl+Shift+Z
+        if (key == Qt.Key.Key_Y and (modifiers & Qt.KeyboardModifier.ControlModifier)) or \
+           (key == Qt.Key.Key_Z and (modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))):
+            self.redo()
+            return
+        # 保存 Ctrl+S
+        if key == Qt.Key.Key_S and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            self.save_and_close()
+            return
+
+        if key == Qt.Key.Key_Space:
             self.toggle_play()
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.stamp_current_char()
-        elif event.key() == Qt.Key.Key_Left:
+        elif key == Qt.Key.Key_Left:
             curr = self.table.currentColumn()
             if curr > 0: self.table.selectColumn(curr - 1)
-        elif event.key() == Qt.Key.Key_Right:
+        elif key == Qt.Key.Key_Right:
             curr = self.table.currentColumn()
             if curr < self.table.columnCount() - 1: self.table.selectColumn(curr + 1)
-        elif event.key() == Qt.Key.Key_Up:
+        elif key == Qt.Key.Key_Up:
             self.adjust_timestamp(50)
-        elif event.key() == Qt.Key.Key_Down:
+        elif key == Qt.Key.Key_Down:
             self.adjust_timestamp(-50)
+        elif key == Qt.Key.Key_J:
+            # 快退 500ms
+            self.player.setPosition(max(0, self.player.position() - 500))
+        elif key == Qt.Key.Key_L:
+            # 快进 500ms
+            self.player.setPosition(self.player.position() + 500)
+        elif key == Qt.Key.Key_R:
+            self.replay_line()
         else:
             super().keyPressEvent(event)
+
+    def undo(self):
+        if self.undo_stack.canUndo():
+            self.undo_stack.undo()
+
+    def redo(self):
+        if self.undo_stack.canRedo():
+            self.undo_stack.redo()
+
+    def _apply_token_time(self, col: int, new_time_ms: int):
+        self.tokens[col]['time'] = new_time_ms
+        self.tokens[col]['edited'] = True
+        self.table.item(1, col).setText(format_ms(new_time_ms))
+        self.update_cell_color(col, is_active=True)
+        self.waveform.set_word_markers([t['time'] for t in self.tokens])
+        self.update_preview_display(self.player.position())
 
     def adjust_timestamp(self, delta_ms):
         curr = self.table.currentColumn()
@@ -229,55 +355,56 @@ class WordLevelEditor(QDialog):
         
         old_time = self.tokens[curr]['time']
         new_time = max(0, old_time + delta_ms)
-        self.tokens[curr]['time'] = new_time
-        self.tokens[curr]['edited'] = True
-        
-        self.table.item(1, curr).setText(format_ms(new_time))
-        self.update_cell_color(curr, is_active=True)
-        
-        # Update preview immediately
-        self.update_preview_display(self.player.position())
-
-    def update_preview_display(self, current_pos):
-        # 构建富文本
-        html = ""
-        
-        # 未播放颜色 #909399 (灰色), 已播放颜色 #409eff (蓝色), 当前字 #67c23a (绿色)
-        for i, token in enumerate(self.tokens):
-            t = token['time']
-            char = token['char']
-            
-            # 判断状态
-            # 下一个字的时间
-            next_t = self.tokens[i+1]['time'] if i < len(self.tokens)-1 else self.end_time_ms
-            
-            if current_pos >= next_t:
-                # 已经完全唱完的字
-                color = "#409eff" # Blue
-            elif current_pos >= t:
-                # 正在唱的字
-                color = "#67c23a" # Green (Active)
-            else:
-                # 还没唱到的字
-                color = "#909399" # Gray
-            
-            html += f"<span style='color:{color};'>{char}</span>"
-            
-        self.lbl_preview.setText(html)
+        cmd = WordTimestampCommand(
+            token_index=curr,
+            old_time_ms=old_time,
+            new_time_ms=new_time,
+            update_callback=self._apply_token_time,
+            description=f"微调时间 {delta_ms}ms"
+        )
+        self.undo_stack.push(cmd)
 
     def stamp_current_char(self):
         curr_col = self.table.currentColumn()
         if curr_col < 0: return
         
         current_pos = self.player.position()
-        self.tokens[curr_col]['time'] = current_pos
-        self.tokens[curr_col]['edited'] = True
+        old_time = self.tokens[curr_col]['time']
         
-        self.table.item(1, curr_col).setText(format_ms(current_pos))
-        self.update_cell_color(curr_col, is_active=True)
+        cmd = WordTimestampCommand(
+            token_index=curr_col,
+            old_time_ms=old_time,
+            new_time_ms=current_pos,
+            update_callback=self._apply_token_time,
+            description="打点当前字"
+        )
+        self.undo_stack.push(cmd)
         
+        # 自动移动到下一个字
         if curr_col < self.table.columnCount() - 1:
             self.table.selectColumn(curr_col + 1)
+
+    def update_preview_display(self, current_pos):
+        html = ""
+        played_color = theme_manager.get_color("highlight_karaoke_played", "#67c23a")
+        active_color = theme_manager.get_color("highlight_karaoke_active", "#409eff")
+        unplayed_color = theme_manager.get_color("highlight_karaoke_unplayed", "#8c92a4")
+
+        for i, token in enumerate(self.tokens):
+            t = token['time']
+            char = token['char']
+            next_t = self.tokens[i+1]['time'] if i < len(self.tokens)-1 else self.end_time_ms
+            
+            if current_pos >= next_t:
+                color = played_color
+            elif current_pos >= t:
+                color = active_color
+            else:
+                color = unplayed_color
+            
+            html += f"<span style='color:{color};'>{char}</span>"
+            
+        self.lbl_preview.setText(html)
 
     def sync_highlight(self):
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
@@ -285,17 +412,18 @@ class WordLevelEditor(QDialog):
             
         pos = self.player.position()
         self.lbl_time.setText(format_ms(pos))
-        
-        # 更新卡拉OK预览
+        self.slider.setValue(pos)
+        self.waveform.set_position(pos)
         self.update_preview_display(pos)
         
-        # === 核心逻辑：超过本句结束时间自动暂停 ===
-        # 允许超过 200ms 的缓冲，避免听到下一句的头
+        # 单句结束判断与单句循环
         if pos >= self.end_time_ms + 200:
-            self.player.pause()
-            self.update_play_icon()
+            if self.loop_playback:
+                self.player.setPosition(self.start_pos)
+            else:
+                self.player.pause()
+                self.update_play_button_text()
             return
-        # ======================================
         
         active_idx = -1
         for i, token in enumerate(self.tokens):
@@ -305,10 +433,10 @@ class WordLevelEditor(QDialog):
                 break
         
         if active_idx != self.last_active_idx:
-            if self.last_active_idx >= 0 and self.last_active_idx < self.table.columnCount():
+            if 0 <= self.last_active_idx < self.table.columnCount():
                 self.update_cell_color(self.last_active_idx, is_active=False)
             
-            if active_idx >= 0 and active_idx < self.table.columnCount():
+            if 0 <= active_idx < self.table.columnCount():
                 self.update_cell_color(active_idx, is_active=True)
                 self.table.scrollToItem(self.table.item(0, active_idx))
             
@@ -319,25 +447,22 @@ class WordLevelEditor(QDialog):
         item = self.table.item(0, col)
         if not item: return
 
-        if is_active: bg = Qt.GlobalColor.cyan
-        elif token['edited']: bg = Qt.GlobalColor.yellow
-        else: bg = Qt.GlobalColor.white
-            
-        if item.background().color() != bg:
-            item.setBackground(bg)
-
-    def update_play_icon(self):
-        # 简单的图标更新
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.btn_play.setText("暂停 (Space)")
+        is_dark = theme_manager.is_dark()
+        if is_active:
+            bg = QColor("#1b3859" if is_dark else "#d9ecff")
+        elif token['edited']:
+            bg = QColor("#594214" if is_dark else "#fdf6ec")
         else:
-            self.btn_play.setText("播放 (Space)")
+            bg = QColor(theme_manager.get_color("bg_input", "#1d1f24"))
+            
+        item.setBackground(bg)
 
     def on_cell_clicked(self, row, col):
         time_ms = self.tokens[col]['time']
         self.player.setPosition(time_ms)
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             self.player.play()
+            self.update_play_button_text()
 
     def reject(self):
         self.player.stop()

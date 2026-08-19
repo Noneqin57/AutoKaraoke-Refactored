@@ -143,5 +143,6 @@ class ConfigManager:
             "CALIBRATION_THRESHOLD": 1.5,
             "RELEASE_VRAM": True,
             "MODEL_DIR": "./models",
-            "OUTPUT_DIR": ""
+            "OUTPUT_DIR": "",
+            "THEME": "dark"
         }

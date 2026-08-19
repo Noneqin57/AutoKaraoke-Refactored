@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
+"""
+Whisper 模型管理对话框 (ModelManagerDialog)
+提供官方模型状态查看、下载与本地删除。
+"""
 import os
-
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QTableWidget,
                              QTableWidgetItem, QPushButton, QProgressBar, QLabel,
-                             QHeaderView, QMessageBox, QWidget)
+                             QHeaderView, QMessageBox, QWidget, QFrame)
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
 
 from core.model_manager import DownloadStopped, ModelManager, ModelInfo, ModelDownloader
 from config import ConfigManager
+from ui.styles.theme_manager import theme_manager
 
 class DownloadWorker(QObject):
     progress = pyqtSignal(int, str)
@@ -38,16 +42,11 @@ class DownloadWorker(QObject):
 class ModelManagerDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("模型管理")
-        self.resize(800, 500)
+        self.setWindowTitle("模型管理 - AutoKaraoke")
+        self.resize(850, 520)
         
-        # Determine model dir from config
         self.config = ConfigManager()
-        model_dir = self.config.get("MODEL_DIR")
-        if not model_dir:
-            model_dir = "models"
-            
-        # If relative, make absolute
+        model_dir = self.config.get("MODEL_DIR") or "models"
         if not os.path.isabs(model_dir):
             model_dir = os.path.abspath(model_dir)
             
@@ -60,31 +59,46 @@ class ModelManagerDialog(QDialog):
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
         
-        info_lbl = QLabel("提示: 模型来自 OpenAI 官方源（Original Whisper）。\n如果网速较慢，请优先下载 Small 或 Medium 模型。")
-        info_lbl.setStyleSheet("color: #666; margin-bottom: 10px;")
-        layout.addWidget(info_lbl)
+        info_card = QFrame()
+        info_card.setObjectName("card")
+        info_lay = QVBoxLayout(info_card)
+        info_lay.setContentsMargins(14, 10, 14, 10)
+        
+        info_lbl = QLabel(
+            "<b>提示：</b>模型均来自 OpenAI 官方 CDN（Original Whisper）。\n"
+            "推荐日常使用 <b>small</b> 或 <b>medium</b> 模型；精细打轴推荐 <b>large-v2</b>。"
+        )
+        info_lbl.setStyleSheet(f"color: {theme_manager.get_color('text_regular', '#dcdfe6')}; line-height: 1.4;")
+        info_lay.addWidget(info_lbl)
+        layout.addWidget(info_card)
 
         self.table = QTableWidget()
         self.table.setColumnCount(5)
         self.table.setHorizontalHeaderLabels(["模型名称", "类型", "状态", "进度", "操作"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
-        layout.addWidget(self.table)
+        self.table.setAlternatingRowColors(True)
+        layout.addWidget(self.table, 1)
 
         btn_box = QHBoxLayout()
         refresh_btn = QPushButton("刷新列表")
+        refresh_btn.setObjectName("info")
         refresh_btn.clicked.connect(self.refresh_list)
+        
         close_btn = QPushButton("关闭")
         close_btn.clicked.connect(self.accept)
+        
         btn_box.addStretch()
         btn_box.addWidget(refresh_btn)
         btn_box.addWidget(close_btn)
         layout.addLayout(btn_box)
 
     def refresh_list(self):
-        # Keep existing rows if possible to avoid flicker, but full refresh is safer for logic
         self.table.setRowCount(0)
         self.model_list = self.manager.get_model_list()
         
@@ -105,11 +119,11 @@ class ModelManagerDialog(QDialog):
             # Progress Bar Container
             pbar_widget = QWidget()
             pbar_layout = QVBoxLayout(pbar_widget)
-            pbar_layout.setContentsMargins(2, 2, 2, 2)
+            pbar_layout.setContentsMargins(4, 4, 4, 4)
             pbar = QProgressBar()
             pbar.setRange(0, 100)
             pbar.setValue(0)
-            pbar.setTextVisible(False) # We will use label for text if needed, or tooltip
+            pbar.setTextVisible(True)
             pbar.hide()
             pbar_layout.addWidget(pbar)
             self.table.setCellWidget(i, 3, pbar_widget)
@@ -118,29 +132,24 @@ class ModelManagerDialog(QDialog):
             self.update_action_button(i, model)
 
     def update_action_button(self, row, model):
-        # Helper to create/update the action button
         btn = QPushButton()
         if model.is_downloaded:
             btn.setText("删除")
-            btn.setStyleSheet("background-color: #f56c6c; color: white;")
+            btn.setObjectName("danger")
             btn.clicked.connect(lambda checked, r=row: self.delete_model(r))
         else:
             if row in self.download_threads:
-                # Active download
-                btn.setText("暂停") # Actually stop
-                btn.setStyleSheet("background-color: #e6a23c; color: white;")
+                btn.setText("暂停")
+                btn.setObjectName("warning")
                 btn.clicked.connect(lambda checked, r=row: self.stop_download(r))
             else:
                 btn.setText("下载")
-                btn.setStyleSheet("background-color: #409eff; color: white;")
                 btn.clicked.connect(lambda checked, r=row: self.start_download(r))
         
         self.table.setCellWidget(row, 4, btn)
 
     def start_download(self, row):
         model = self.model_list[row]
-        
-        # Update UI
         self.table.item(row, 2).setText("下载中...")
         
         pbar_widget = self.table.cellWidget(row, 3)
@@ -148,7 +157,6 @@ class ModelManagerDialog(QDialog):
         pbar.show()
         pbar.setValue(0)
 
-        # Create Thread
         thread = QThread()
         worker = DownloadWorker(model)
         worker.moveToThread(thread)
@@ -163,16 +171,12 @@ class ModelManagerDialog(QDialog):
         
         self.download_threads[row] = (thread, worker)
         thread.start()
-        
-        # Update button to "Pause"
         self.update_action_button(row, model)
 
     def stop_download(self, row):
         if row in self.download_threads:
             thread, worker = self.download_threads[row]
             worker.stop()
-            # UI update happens in on_download_finished (triggered by stop usually indirectly or we force it)
-            # Actually, stop() just sets a flag. The thread will finish with success=False.
             self.table.item(row, 2).setText("正在停止...")
             btn = self.table.cellWidget(row, 4)
             btn.setEnabled(False)
@@ -184,18 +188,11 @@ class ModelManagerDialog(QDialog):
             if percent >= 0:
                 pbar.setValue(percent)
             pbar.setToolTip(msg)
-            # Optional: Show text in status column? 
-            # self.table.item(row, 2).setText(msg)
 
     def on_download_finished(self, row, success, msg):
-        # Note: Do not delete thread ref here to avoid QThread destroyed while running error
-        # It will be cleaned up in cleanup_thread when thread actually finishes
-            
         if success:
             self.model_list[row].is_downloaded = True
             self.refresh_row(row)
-            # Use QTimer.singleShot to show message box after a slight delay to allow event loop to process
-            # But direct call is usually fine if we don't delete thread here
             QMessageBox.information(self, "成功", f"模型 {self.model_list[row].name} 下载完成")
         else:
             self.refresh_row(row)
@@ -216,23 +213,17 @@ class ModelManagerDialog(QDialog):
             self.refresh_row(row)
 
     def refresh_row(self, row):
-        # Helper to just refresh one row's UI based on current model state
         model = self.model_list[row]
-        
         self.table.item(row, 2).setText("已下载" if model.is_downloaded else "未下载")
         
         pbar_widget = self.table.cellWidget(row, 3)
         pbar = pbar_widget.findChild(QProgressBar)
-        if not self.model_list[row].is_downloaded:
-             pbar.hide()
-             pbar.setValue(0)
-        else:
-             pbar.hide()
+        pbar.hide()
+        pbar.setValue(0)
         
         self.update_action_button(row, model)
         
     def closeEvent(self, event):
-        # Warn if downloads are active
         if self.download_threads:
             reply = QMessageBox.warning(self, "警告", "有正在进行的下载任务，关闭窗口将终止下载。\n确定要关闭吗？",
                                         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -240,10 +231,9 @@ class ModelManagerDialog(QDialog):
                 event.ignore()
                 return
             
-            # Stop all threads
             for row, (thread, worker) in self.download_threads.items():
                 worker.stop()
                 thread.quit()
-                thread.wait() # force wait
+                thread.wait()
                 
         event.accept()

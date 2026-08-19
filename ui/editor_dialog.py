@@ -1,76 +1,126 @@
 # -*- coding: utf-8 -*-
+"""
+歌词精细校准对话框 (LrcEditorDialog)
+提供逐行同步打点、时间轴整体/局部实时偏移、双向跳转、字级精细联动与完整撤销重做。
+"""
 import os
 import re
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-                             QSlider, QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView, QStyle, QMessageBox)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+                             QFrame, QComboBox, QSpinBox)
 from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
-from PyQt6.QtGui import QColor
+from PyQt6.QtGui import QUndoStack, QUndoCommand, QColor
 
 from utils.time_utils import format_ms, parse_time_tag
 from ui.word_editor import WordLevelEditor
+from ui.components.clickable_slider import ClickableSlider
+from ui.components.waveform_widget import WaveformWidget
+from ui.commands.lrc_commands import BatchLineShiftCommand
+from ui.styles.theme_manager import theme_manager
+
+class LineStampCommand(QUndoCommand):
+    """逐行打点/单行时间戳修改指令"""
+    def __init__(self, dialog, row: int, old_time_str: str, old_text: str,
+                 new_time_str: str, new_text: str, affected_translations: list,
+                 description: str = "修改行时间戳"):
+        super().__init__(description)
+        self.dialog = dialog
+        self.row = row
+        self.old_time_str = old_time_str
+        self.old_text = old_text
+        self.new_time_str = new_time_str
+        self.new_text = new_text
+        self.affected_translations = affected_translations # [(row, old_time, new_time)]
+
+    def redo(self):
+        self.dialog.table.setItem(self.row, 0, QTableWidgetItem(self.new_time_str))
+        self.dialog.table.setItem(self.row, 1, QTableWidgetItem(self.new_text))
+        for r, _, new_t in self.affected_translations:
+            self.dialog.table.setItem(r, 0, QTableWidgetItem(new_t))
+        self.dialog.cache_timestamps()
+        self.dialog.refresh_playback_view()
+
+    def undo(self):
+        self.dialog.table.setItem(self.row, 0, QTableWidgetItem(self.old_time_str))
+        self.dialog.table.setItem(self.row, 1, QTableWidgetItem(self.old_text))
+        for r, old_t, _ in self.affected_translations:
+            self.dialog.table.setItem(r, 0, QTableWidgetItem(old_t))
+        self.dialog.cache_timestamps()
+        self.dialog.refresh_playback_view()
+
 
 class LrcEditorDialog(QDialog):
     def __init__(self, audio_path, lrc_content, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("歌词精细校准 - AutoKaraoke Editor")
-        self.resize(1000, 750)
+        self.setWindowTitle("歌词精细校准与时间轴调整 - AutoKaraoke Editor")
+        self.resize(1080, 840)
         self.audio_path = audio_path
         self.lrc_content = lrc_content
         self.result_lrc = None
         
+        self.undo_stack = QUndoStack(self)
         self.player = QMediaPlayer()
         self.audio_output = QAudioOutput()
         self.player.setAudioOutput(self.audio_output)
         
-        # 新增：时间戳缓存和高亮追踪
-        self.cached_timestamps = []  # 缓存解析后的时间戳 [(row, time_ms), ...]
-        self.last_highlight_row = -1  # 记录上次高亮的行
-        self.translation_rows = set()  # 记录翻译行的索引
+        self.cached_timestamps = []  # [(row, time_ms), ...]
+        self.last_highlight_row = -1
+        self.translation_rows = set()
         
         self.setup_ui()
         self.load_lrc_data()
         self.load_audio()
         
         self.timer = QTimer(self)
-        self.timer.setInterval(100)
+        self.timer.setInterval(50)
         self.timer.timeout.connect(self.update_progress)
         self.timer.start()
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
         
-        help_lbl = QLabel(
-            "<b>操作：</b>单击暂停选中 | 双击跳转 | Enter键同步当前行 | 空格播放/暂停"
-        )
-        help_lbl.setStyleSheet("background: #e6f7ff; padding: 10px; border: 1px solid #91d5ff;")
-        layout.addWidget(help_lbl)
+        # === 顶部卡拉OK预览卡片 ===
+        preview_card = QFrame()
+        preview_card.setObjectName("card")
+        preview_card.setStyleSheet(f"""
+            QFrame#card {{
+                background-color: {theme_manager.get_color('bg_preview', '#121316')};
+                border-radius: 10px;
+                padding: 10px;
+            }}
+        """)
+        p_lay = QVBoxLayout(preview_card)
+        p_lay.setContentsMargins(12, 6, 12, 6)
+        p_lay.setSpacing(2)
         
-        # 新增：顶部卡拉OK预览区
-        preview_container = QVBoxLayout()
-        preview_container.setSpacing(5)
-        
-        lbl_hint = QLabel("当前播放")
-        lbl_hint.setStyleSheet("color: #909399; font-size: 12px;")
-        preview_container.addWidget(lbl_hint)
+        top_info = QHBoxLayout()
+        lbl_hint = QLabel("实时逐行预览 (双击下方行进入逐字打轴 | 调整时间轴可直接试听效果)")
+        lbl_hint.setStyleSheet(f"color: {theme_manager.get_color('text_secondary', '#8c92a4')}; font-size: 11px; font-weight: bold;")
+        top_info.addWidget(lbl_hint)
+        p_lay.addLayout(top_info)
         
         self.lbl_line_preview = QLabel()
         self.lbl_line_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_line_preview.setStyleSheet("""
-            background-color: #303133;
-            border-radius: 8px;
-            padding: 15px;
-            font-family: 'Microsoft YaHei';
-            font-size: 24px;
+            font-family: 'Microsoft YaHei', sans-serif;
+            font-size: 22px;
             font-weight: bold;
-            min-height: 60px;
-            color: #909399;
+            min-height: 48px;
         """)
-        self.lbl_line_preview.setText("等待播放...")
-        preview_container.addWidget(self.lbl_line_preview)
+        self.lbl_line_preview.setText("<span style='color:#8c92a4;'>等待播放...</span>")
+        p_lay.addWidget(self.lbl_line_preview)
         
-        layout.addLayout(preview_container)
+        # 音频波形可视化组件
+        self.waveform = WaveformWidget()
+        self.waveform.seek_requested.connect(self.set_position)
+        p_lay.addWidget(self.waveform)
+        
+        layout.addWidget(preview_card)
 
+        # === 歌词表格 ===
         self.table = QTableWidget()
         self.table.setColumnCount(2)
         self.table.setHorizontalHeaderLabels(["时间戳", "歌词内容"])
@@ -81,40 +131,141 @@ class LrcEditorDialog(QDialog):
         
         self.table.cellDoubleClicked.connect(self.seek_to_row)
         self.table.cellPressed.connect(self.pause_on_click)
-        layout.addWidget(self.table)
+        layout.addWidget(self.table, 1)
         
-        ctrl_box = QHBoxLayout()
-        self.btn_play = QPushButton()
-        self.update_play_icon()
-        self.btn_play.clicked.connect(self.toggle_play)
-        
+        # === 播放控制与进度条卡片 ===
+        ctrl_card = QFrame()
+        ctrl_card.setObjectName("card")
+        c_lay = QVBoxLayout(ctrl_card)
+        c_lay.setContentsMargins(14, 10, 14, 10)
+        c_lay.setSpacing(8)
+
+        slider_box = QHBoxLayout()
         self.lbl_curr = QLabel("00:00.000")
-        self.lbl_curr.setMinimumWidth(80)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.lbl_curr.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {theme_manager.get_color('accent_primary', '#409eff')};")
+        self.slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.slider.sliderMoved.connect(self.set_position)
-        self.slider.sliderPressed.connect(self.pause_for_seek)
-        self.slider.sliderReleased.connect(self.resume_after_seek)
+        self.slider.clicked_position.connect(self.set_position)
         self.lbl_total = QLabel("00:00.000")
+        self.lbl_total.setStyleSheet(f"color: {theme_manager.get_color('text_secondary', '#8c92a4')};")
         
-        ctrl_box.addWidget(self.btn_play)
-        ctrl_box.addWidget(self.lbl_curr)
-        ctrl_box.addWidget(self.slider)
-        ctrl_box.addWidget(self.lbl_total)
-        layout.addLayout(ctrl_box)
-        
-        btn_box = QHBoxLayout()
+        slider_box.addWidget(self.lbl_curr)
+        slider_box.addWidget(self.slider)
+        slider_box.addWidget(self.lbl_total)
+        c_lay.addLayout(slider_box)
+
+        btn_ctrl_row = QHBoxLayout()
+        self.btn_play = QPushButton("播放/暂停 (Space)")
+        self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_play.clicked.connect(self.toggle_play)
+
         btn_stamp = QPushButton("智能同步写入 (Enter)")
-        btn_stamp.setStyleSheet("background: #e6a23c; color: white; font-weight: bold;")
+        btn_stamp.setObjectName("warning")
+        btn_stamp.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_stamp.clicked.connect(self.stamp_current_time)
+
+        self.btn_undo = QPushButton("撤销 (Ctrl+Z)")
+        self.btn_undo.setObjectName("info")
+        self.btn_undo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_undo.clicked.connect(self.undo)
+
+        self.btn_redo = QPushButton("重做 (Ctrl+Y)")
+        self.btn_redo.setObjectName("info")
+        self.btn_redo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_redo.clicked.connect(self.redo)
+
+        btn_ctrl_row.addWidget(self.btn_play)
+        btn_ctrl_row.addWidget(btn_stamp)
+        btn_ctrl_row.addStretch()
+        btn_ctrl_row.addWidget(self.btn_undo)
+        btn_ctrl_row.addWidget(self.btn_redo)
+        c_lay.addLayout(btn_ctrl_row)
+
+        layout.addWidget(ctrl_card)
+
+        # === 【全新】时间轴实时偏移调整卡片 (Offset Toolbar) ===
+        offset_card = QFrame()
+        offset_card.setObjectName("card")
+        o_lay = QHBoxLayout(offset_card)
+        o_lay.setContentsMargins(14, 8, 14, 8)
+        o_lay.setSpacing(8)
+
+        lbl_offset_title = QLabel("时间轴偏移调整:")
+        lbl_offset_title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        o_lay.addWidget(lbl_offset_title)
+
+        self.combo_offset_scope = QComboBox()
+        self.combo_offset_scope.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.combo_offset_scope.addItem("全部歌词 (All)", "all")
+        self.combo_offset_scope.addItem("当前行至末尾 (To End)", "to_end")
+        self.combo_offset_scope.addItem("仅选中的行 (Selected)", "selected")
+        self.combo_offset_scope.setToolTip("选择时间偏移的影响范围")
+        o_lay.addWidget(self.combo_offset_scope)
+
+        # 快捷微调按钮
+        btn_m200 = QPushButton("-200ms")
+        btn_m200.setObjectName("info")
+        btn_m200.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_m200.setToolTip("将目标范围时间戳提前 200ms")
+        btn_m200.clicked.connect(lambda: self.apply_quick_offset(-200))
+        o_lay.addWidget(btn_m200)
+
+        btn_m50 = QPushButton("-50ms")
+        btn_m50.setObjectName("info")
+        btn_m50.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_m50.setToolTip("将目标范围时间戳提前 50ms")
+        btn_m50.clicked.connect(lambda: self.apply_quick_offset(-50))
+        o_lay.addWidget(btn_m50)
+
+        btn_p50 = QPushButton("+50ms")
+        btn_p50.setObjectName("info")
+        btn_p50.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_p50.setToolTip("将目标范围时间戳延后 50ms")
+        btn_p50.clicked.connect(lambda: self.apply_quick_offset(50))
+        o_lay.addWidget(btn_p50)
+
+        btn_p200 = QPushButton("+200ms")
+        btn_p200.setObjectName("info")
+        btn_p200.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_p200.setToolTip("将目标范围时间戳延后 200ms")
+        btn_p200.clicked.connect(lambda: self.apply_quick_offset(200))
+        o_lay.addWidget(btn_p200)
+
+        o_lay.addSpacing(6)
+
+        self.spin_offset = QSpinBox()
+        self.spin_offset.setRange(-30000, 30000)
+        self.spin_offset.setSingleStep(50)
+        self.spin_offset.setValue(0)
+        self.spin_offset.setSuffix(" ms")
+        self.spin_offset.setToolTip("自定义偏移量：正数延后，负数提前。回车或点击应用。")
+        self.spin_offset.returnPressed.connect(self.apply_spinbox_offset)
+        o_lay.addWidget(self.spin_offset)
+
+        btn_apply_spin = QPushButton("应用自定义偏移")
+        btn_apply_spin.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        btn_apply_spin.clicked.connect(self.apply_spinbox_offset)
+        o_lay.addWidget(btn_apply_spin)
+
+        layout.addWidget(offset_card)
         
-        btn_save = QPushButton("保存并关闭")
-        btn_save.setStyleSheet("background: #67c23a; color: white; font-weight: bold;")
-        btn_save.clicked.connect(self.save_lrc) 
+        # === 快捷键提示条 ===
+        tips = QLabel("快捷键: [Space]播放/暂停 | [Enter]写入当前时间戳并跳下行 | [Ctrl+←/→]微调±100ms | [J/L]步进±1s | [Ctrl+Z]撤销偏移")
+        tips.setStyleSheet(f"color: {theme_manager.get_color('text_secondary', '#8c92a4')}; font-size: 11px;")
+        layout.addWidget(tips)
+
+        # === 底部保存/取消栏 ===
+        btn_box = QHBoxLayout()
+        btn_save = QPushButton("保存并应用 (Ctrl+S)")
+        btn_save.setObjectName("success")
+        btn_save.setMinimumHeight(36)
+        btn_save.clicked.connect(self.save_lrc)
         
         btn_cancel = QPushButton("取消")
-        btn_cancel.clicked.connect(self.reject) 
+        btn_cancel.setObjectName("secondary")
+        btn_cancel.setMinimumHeight(36)
+        btn_cancel.clicked.connect(self.reject)
         
-        btn_box.addWidget(btn_stamp)
         btn_box.addStretch()
         btn_box.addWidget(btn_save)
         btn_box.addWidget(btn_cancel)
@@ -126,11 +277,13 @@ class LrcEditorDialog(QDialog):
         if self.audio_path and os.path.exists(self.audio_path):
             self.player.setSource(QUrl.fromLocalFile(self.audio_path))
             self.player.mediaStatusChanged.connect(self.on_media_status)
+            self.waveform.load_audio(self.audio_path)
     
     def on_media_status(self, status):
-        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+        if status in (QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia):
             duration = self.player.duration()
             self.slider.setRange(0, duration)
+            self.waveform.set_duration(duration)
             self.lbl_total.setText(format_ms(duration))
 
     def load_lrc_data(self):
@@ -150,8 +303,6 @@ class LrcEditorDialog(QDialog):
                 content = match.group(2)
                 
                 self.table.insertRow(row)
-                
-                # 检测翻译行（时间戳相同且不是第一次出现）
                 if timestamp == last_timestamp and row > 0:
                     self.translation_rows.add(row)
                 
@@ -165,74 +316,82 @@ class LrcEditorDialog(QDialog):
                 self.table.setItem(row, 1, QTableWidgetItem(line))
                 row += 1
         
-        # 新增：加载完成后缓存时间戳
         self.cache_timestamps()
 
     def table_key_event(self, event):
-        if event.key() == Qt.Key.Key_Space:
+        key = event.key()
+        modifiers = event.modifiers()
+
+        if key == Qt.Key.Key_Z and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            self.undo()
+            return
+        if (key == Qt.Key.Key_Y and (modifiers & Qt.KeyboardModifier.ControlModifier)) or \
+           (key == Qt.Key.Key_Z and (modifiers & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier))):
+            self.redo()
+            return
+        if key == Qt.Key.Key_S and (modifiers & Qt.KeyboardModifier.ControlModifier):
+            self.save_lrc()
+            return
+
+        if key == Qt.Key.Key_Space:
             self.toggle_play()
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.stamp_current_time()
-        elif event.key() == Qt.Key.Key_Left and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            # Ctrl+Left: 时间戳 -100ms
+        elif key == Qt.Key.Key_Left and (modifiers & Qt.KeyboardModifier.ControlModifier):
             self.adjust_timestamp(-100)
-        elif event.key() == Qt.Key.Key_Right and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            # Ctrl+Right: 时间戳 +100ms
+        elif key == Qt.Key.Key_Right and (modifiers & Qt.KeyboardModifier.ControlModifier):
             self.adjust_timestamp(100)
+        elif key == Qt.Key.Key_J:
+            self.player.setPosition(max(0, self.player.position() - 1000))
+        elif key == Qt.Key.Key_L:
+            self.player.setPosition(self.player.position() + 1000)
         else:
             QTableWidget.keyPressEvent(self.table, event)
+
+    def undo(self):
+        if self.undo_stack.canUndo():
+            self.undo_stack.undo()
+
+    def redo(self):
+        if self.undo_stack.canRedo():
+            self.undo_stack.redo()
 
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
             self.player.play()
-        self.update_play_icon()
+        self.update_play_button_text()
 
-    def update_play_icon(self):
-        style = self.style()
+    def update_play_button_text(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaPause)
+            self.btn_play.setText("暂停 (Space)")
         else:
-            icon = style.standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
-        self.btn_play.setIcon(icon)
+            self.btn_play.setText("播放 (Space)")
 
     def update_progress(self):
         pos = self.player.position()
         self.slider.setValue(pos)
+        self.waveform.set_position(pos)
         self.lbl_curr.setText(format_ms(pos))
-        
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            # 新增：高亮当前播放的行
-            self.highlight_current_line(pos)
-            # 新增：更新预览区
-            self.update_line_preview(pos)
-        else:
-            # 暂停时也更新预览（静态显示）
-            self.update_line_preview(pos)
+        self.highlight_current_line(pos)
+        self.update_line_preview(pos)
 
     def set_position(self, pos):
         self.player.setPosition(pos)
+        self.slider.setValue(pos)
+        self.waveform.set_position(pos)
         self.lbl_curr.setText(format_ms(pos))
-        
-        # 新增：拖拽时也更新预览和高亮
         self.update_line_preview(pos)
         self.highlight_current_line(pos)
 
-    def pause_for_seek(self):
-        self.was_playing = (self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState)
-        self.player.pause()
+    def pause_on_click(self, row, col):
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+            self.update_play_button_text()
 
-    def resume_after_seek(self):
-        if hasattr(self, 'was_playing') and self.was_playing:
-            self.player.play()
-            self.update_play_icon()
-    
     def seek_to_row(self, row, col):
-        """
-        双击进入逐字编辑模式
-        """
-        # 获取当前行的时间和文本
+        """双击进入逐字编辑模式"""
         time_item = self.table.item(row, 0)
         text_item = self.table.item(row, 1)
         
@@ -242,40 +401,111 @@ class LrcEditorDialog(QDialog):
         text_content = text_item.text()
         start_ms = parse_time_tag(time_str)
         
-        # === 关键：计算本句的结束时间 (下一句的开始时间) ===
-        end_ms = self.player.duration() # 默认为歌曲总时长
+        end_ms = self.player.duration()
         next_row = row + 1
-        
-        # 寻找下一个有效的时间戳作为结束时间
         while next_row < self.table.rowCount():
             next_time_item = self.table.item(next_row, 0)
             if next_time_item:
                 next_start_ms = parse_time_tag(next_time_item.text())
-                if next_start_ms > start_ms: # 确保下一句时间确实比这句晚
+                if next_start_ms > start_ms:
                     end_ms = next_start_ms
                     break
             next_row += 1
-        # =================================================
         
-        # 暂停主播放器
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self.update_play_icon()
+            self.update_play_button_text()
             
-        # 打开逐字编辑器，传入结束时间
         editor = WordLevelEditor(self.audio_path, text_content, start_ms, end_ms, self)
         
         if editor.exec():
-            # 保存逻辑
             if editor.result_start_time:
                 self.table.setItem(row, 0, QTableWidgetItem(editor.result_start_time))
             if editor.result_lrc_content:
                 self.table.setItem(row, 1, QTableWidgetItem(editor.result_lrc_content))
-    
-    def pause_on_click(self, row, col):
-        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-            self.player.pause()
-            self.update_play_icon()
+            self.cache_timestamps()
+            self.refresh_playback_view()
+
+    # === 时间轴偏移工具箱逻辑 ===
+    def get_target_rows_for_offset(self) -> list:
+        scope = self.combo_offset_scope.currentData() or "all"
+        total_rows = self.table.rowCount()
+        
+        if scope == "all":
+            return list(range(total_rows))
+        
+        selected_items = self.table.selectedItems()
+        selected_rows = sorted(list(set(it.row() for it in selected_items)))
+        
+        if scope == "to_end":
+            start_row = selected_rows[0] if selected_rows else 0
+            return list(range(start_row, total_rows))
+        
+        if scope == "selected":
+            return selected_rows if selected_rows else list(range(total_rows))
+            
+        return list(range(total_rows))
+
+    def apply_quick_offset(self, delta_ms: int):
+        self.apply_batch_offset(delta_ms)
+
+    def apply_spinbox_offset(self):
+        val = self.spin_offset.value()
+        if val != 0:
+            self.apply_batch_offset(val)
+            self.spin_offset.setValue(0)
+
+    def apply_batch_offset(self, delta_ms: int):
+        if delta_ms == 0:
+            return
+            
+        target_rows = self.get_target_rows_for_offset()
+        if not target_rows:
+            return
+
+        old_data = []
+        new_data = []
+
+        for r in target_rows:
+            t_item = self.table.item(r, 0)
+            c_item = self.table.item(r, 1)
+            
+            old_time_str = t_item.text() if t_item else ""
+            old_text = c_item.text() if c_item else ""
+            
+            # 计算新时间戳
+            new_time_str = old_time_str
+            if old_time_str:
+                ms = parse_time_tag(old_time_str)
+                if ms >= 0:
+                    new_ms = max(0, ms + delta_ms)
+                    new_time_str = f"[{format_ms(new_ms)}]"
+            
+            # 计算新文本（包含逐字内嵌时间戳）
+            new_text = self.shift_timestamps_in_string(old_text, delta_ms)
+            
+            old_data.append((r, old_time_str, old_text))
+            new_data.append((r, new_time_str, new_text))
+
+        def _apply(data_list):
+            for r, t_str, c_str in data_list:
+                self.table.setItem(r, 0, QTableWidgetItem(t_str))
+                self.table.setItem(r, 1, QTableWidgetItem(c_str))
+            self.cache_timestamps()
+            self.refresh_playback_view()
+
+        cmd = BatchLineShiftCommand(
+            old_data=old_data,
+            new_data=new_data,
+            apply_callback=_apply,
+            description=f"时间轴偏移 {delta_ms:+d}ms"
+        )
+        self.undo_stack.push(cmd)
+
+    def refresh_playback_view(self):
+        pos = self.player.position()
+        self.highlight_current_line(pos)
+        self.update_line_preview(pos)
 
     def stamp_current_time(self):
         current_rows = self.table.selectedItems()
@@ -286,15 +516,13 @@ class LrcEditorDialog(QDialog):
         new_time_str = f"[{format_ms(current_pos_ms)}]"
         
         old_time_item = self.table.item(row, 0)
-        old_time_str = old_time_item.text()
+        old_time_str = old_time_item.text() if old_time_item else ""
         old_start_ms = parse_time_tag(old_time_str)
         
         lyric_item = self.table.item(row, 1)
-        original_text = lyric_item.text()
+        original_text = lyric_item.text() if lyric_item else ""
         
-        delta_ms = 0
-        if old_start_ms >= 0:
-            delta_ms = current_pos_ms - old_start_ms
+        delta_ms = current_pos_ms - old_start_ms if old_start_ms >= 0 else 0
 
         # 修复首字异常空隙
         extra_fix_ms = 0
@@ -306,25 +534,31 @@ class LrcEditorDialog(QDialog):
                 target_gap = 300
                 extra_fix_ms = -(original_gap - target_gap)
 
-        self.table.setItem(row, 0, QTableWidgetItem(new_time_str))
-        
         total_shift_ms = delta_ms + extra_fix_ms
         shifted_text = self.shift_timestamps_in_string(original_text, total_shift_ms)
-        self.table.setItem(row, 1, QTableWidgetItem(shifted_text))
         
-        # 同步更新后续翻译行
+        affected_trans = []
         next_row = row + 1
         while next_row < self.table.rowCount():
             next_time_item = self.table.item(next_row, 0)
             if not next_time_item: break
-            if next_time_item.text() == old_time_str:
-                self.table.setItem(next_row, 0, QTableWidgetItem(new_time_str))
+            if next_time_item.text() == old_time_str and next_row in self.translation_rows:
+                affected_trans.append((next_row, old_time_str, new_time_str))
                 next_row += 1
             else:
                 break
         
-        # 新增：修改时间戳后重新缓存
-        self.cache_timestamps()
+        cmd = LineStampCommand(
+            dialog=self,
+            row=row,
+            old_time_str=old_time_str,
+            old_text=original_text,
+            new_time_str=new_time_str,
+            new_text=shifted_text,
+            affected_translations=affected_trans,
+            description="写入行时间戳"
+        )
+        self.undo_stack.push(cmd)
         
         if row < self.table.rowCount() - 1:
             self.table.selectRow(row + 1)
@@ -341,29 +575,7 @@ class LrcEditorDialog(QDialog):
         pattern = re.compile(r'\[\d{2}:\d{2}\.\d{2,3}\]')
         return pattern.sub(replace_func, text)
 
-    def save_lrc(self):
-        lines = []
-        for r in range(self.table.rowCount()):
-            t = self.table.item(r, 0).text()
-            c = self.table.item(r, 1).text()
-            lines.append(f"{t}{c}")
-        self.result_lrc = "\n".join(lines)
-        self.accept()
-    
-    def stop_and_release(self):
-        if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
-            self.player.stop()
-
-    def accept(self):
-        self.stop_and_release()
-        super().accept()
-        
-    def reject(self):
-        self.stop_and_release()
-        super().reject()
-
     def cache_timestamps(self):
-        """缓存所有行的时间戳（毫秒），优化查找性能"""
         self.cached_timestamps = []
         for row in range(self.table.rowCount()):
             time_item = self.table.item(row, 0)
@@ -372,103 +584,79 @@ class LrcEditorDialog(QDialog):
                 self.cached_timestamps.append((row, ms))
             else:
                 self.cached_timestamps.append((row, -1))
-    
+
     def highlight_current_line(self, current_pos_ms):
-        """根据播放位置高亮当前行"""
         target_row = -1
-        
-        # 查找最匹配的行（优先匹配原文行，跳过翻译行）
         for i, (row, start_ms) in enumerate(self.cached_timestamps):
-            if start_ms < 0:
-                continue  # 跳过无效时间戳
-            
-            # 跳过翻译行，只高亮原文
-            if row in self.translation_rows:
+            if start_ms < 0 or row in self.translation_rows:
                 continue
             
-            # 获取下一行的开始时间作为当前行的结束时间
             end_ms = None
             for j in range(i + 1, len(self.cached_timestamps)):
-                # 跳过翻译行，寻找下一个原文行的时间戳
                 if self.cached_timestamps[j][0] not in self.translation_rows and self.cached_timestamps[j][1] > 0:
                     end_ms = self.cached_timestamps[j][1]
                     break
             
             if end_ms is None:
-                # 最后一行，持续到音频结束
                 if current_pos_ms >= start_ms:
                     target_row = row
                     break
             else:
-                # 判断当前位置是否在此行的时间范围内
                 if start_ms <= current_pos_ms < end_ms:
                     target_row = row
                     break
         
-        # 更新高亮
         if target_row != self.last_highlight_row:
-            # 清除旧高亮
             if self.last_highlight_row >= 0:
-                self.clear_row_highlight(self.last_highlight_row)
-                # 同时清除翻译行的高亮
-                self.clear_translation_highlight(self.last_highlight_row)
+                self.set_row_highlight(self.last_highlight_row, False)
+                self.highlight_translation_rows(self.last_highlight_row, False)
             
-            # 应用新高亮
             if target_row >= 0:
                 self.set_row_highlight(target_row, True)
-                # 同时高亮翻译行
                 self.highlight_translation_rows(target_row, True)
-                # 自动滚动到当前行
                 self.table.scrollToItem(self.table.item(target_row, 0))
+                
+                # 同步更新波形高亮选区
+                h_start = self.cached_timestamps[target_row][1]
+                h_end = self.player.duration()
+                for j in range(target_row + 1, len(self.cached_timestamps)):
+                    if self.cached_timestamps[j][0] not in self.translation_rows and self.cached_timestamps[j][1] > 0:
+                        h_end = self.cached_timestamps[j][1]
+                        break
+                self.waveform.set_highlight_region(h_start, h_end)
+            else:
+                self.waveform.set_highlight_region(-1, -1)
             
             self.last_highlight_row = target_row
-    
+
     def highlight_translation_rows(self, original_row, is_playing):
-        """高亮原文行对应的翻译行"""
-        if original_row < 0:
-            return
-        
-        # 获取原文行的时间戳
+        if original_row < 0: return
         time_item = self.table.item(original_row, 0)
-        if not time_item:
-            return
+        if not time_item: return
         
         original_timestamp = time_item.text()
-        
-        # 查找所有相同时间戳的翻译行
         for row in range(original_row + 1, self.table.rowCount()):
-            if row not in self.translation_rows:
-                break  # 遇到非翻译行，停止查找
-            
+            if row not in self.translation_rows: break
             trans_time_item = self.table.item(row, 0)
             if trans_time_item and trans_time_item.text() == original_timestamp:
                 self.set_row_highlight(row, is_playing)
-    
-    def clear_translation_highlight(self, original_row):
-        """清除原文行对应的翻译行高亮"""
-        self.highlight_translation_rows(original_row, False)
-    
+
     def set_row_highlight(self, row, is_playing):
-        """设置行高亮样式"""
+        is_dark = theme_manager.is_dark()
         if is_playing:
-            bg_color = QColor("#e6f7ff")  # 淡蓝色背景
-            text_color = QColor("#1890ff")  # 深蓝色文字
+            bg_color = QColor("#1b3859" if is_dark else "#e6f7ff")
+            text_color = QColor("#79bbff" if is_dark else "#1890ff")
         else:
-            bg_color = QColor(Qt.GlobalColor.white)
-            text_color = QColor(Qt.GlobalColor.black)
+            bg_color = QColor(theme_manager.get_color("bg_input", "#1d1f24"))
+            text_color = QColor(theme_manager.get_color("text_primary", "#ffffff"))
         
         for col in range(self.table.columnCount()):
             item = self.table.item(row, col)
             if item:
                 item.setBackground(bg_color)
                 item.setForeground(text_color)
-    
-    def clear_row_highlight(self, row):
-        """清除行高亮"""
-        self.set_row_highlight(row, False)
-    
+
     def adjust_timestamp(self, delta_ms):
-        """调整当前选中行的时间戳"""
         current_rows = self.table.selectedItems()
         if not current_rows: return
         
@@ -476,34 +664,33 @@ class LrcEditorDialog(QDialog):
         time_item = self.table.item(row, 0)
         if not time_item or not time_item.text(): return
         
-        old_time_ms = parse_time_tag(time_item.text())
+        old_time_str = time_item.text()
+        old_time_ms = parse_time_tag(old_time_str)
         if old_time_ms < 0: return
         
         new_time_ms = max(0, old_time_ms + delta_ms)
         new_time_str = f"[{format_ms(new_time_ms)}]"
         
-        self.table.setItem(row, 0, QTableWidgetItem(new_time_str))
-        
-        # 同时调整字级时间戳
         lyric_item = self.table.item(row, 1)
-        if lyric_item:
-            original_text = lyric_item.text()
-            shifted_text = self.shift_timestamps_in_string(original_text, delta_ms)
-            self.table.setItem(row, 1, QTableWidgetItem(shifted_text))
+        original_text = lyric_item.text() if lyric_item else ""
+        shifted_text = self.shift_timestamps_in_string(original_text, delta_ms)
         
-        # 重新缓存
-        self.cache_timestamps()
-    
+        cmd = LineStampCommand(
+            dialog=self,
+            row=row,
+            old_time_str=old_time_str,
+            old_text=original_text,
+            new_time_str=new_time_str,
+            new_text=shifted_text,
+            affected_translations=[],
+            description=f"微调单行时间 {delta_ms:+d}ms"
+        )
+        self.undo_stack.push(cmd)
+
     def update_line_preview(self, current_pos_ms):
-        """更新顶部预览区"""
-        # 找到当前行（优先原文行）
         current_row = -1
         for i, (row, start_ms) in enumerate(self.cached_timestamps):
-            if start_ms < 0:
-                continue
-            
-            # 跳过翻译行
-            if row in self.translation_rows:
+            if start_ms < 0 or row in self.translation_rows:
                 continue
             
             end_ms = None
@@ -522,77 +709,77 @@ class LrcEditorDialog(QDialog):
                     break
         
         if current_row < 0:
-            self.lbl_line_preview.setText("<span style='color:#909399;'>等待播放...</span>")
+            self.lbl_line_preview.setText("<span style='color:#8c92a4;'>等待播放...</span>")
             return
         
-        # 获取原文
         text_item = self.table.item(current_row, 1)
-        if not text_item:
-            return
-        
+        if not text_item: return
         line_text = text_item.text()
         
-        # 查找翻译行
         translations = []
         time_item = self.table.item(current_row, 0)
         if time_item:
             original_timestamp = time_item.text()
             for row in range(current_row + 1, self.table.rowCount()):
-                if row not in self.translation_rows:
-                    break
+                if row not in self.translation_rows: break
                 trans_time_item = self.table.item(row, 0)
                 trans_text_item = self.table.item(row, 1)
                 if trans_time_item and trans_text_item and trans_time_item.text() == original_timestamp:
                     translations.append(trans_text_item.text())
         
-        # 渲染预览
         if '[' in line_text and ']' in line_text and re.search(r'\[\d{2}:\d{2}\.\d{2,3}\]', line_text):
-            # 有字级时间戳，渲染卡拉OK效果
             html = self.render_karaoke_html(line_text, current_pos_ms)
         else:
-            # 整行高亮
-            html = f"<span style='color:#67c23a;'>{line_text}</span>"
+            active_color = theme_manager.get_color("highlight_karaoke_played", "#67c23a")
+            html = f"<span style='color:{active_color};'>{line_text}</span>"
         
-        # 添加翻译（灰色小字）
         if translations:
-            trans_html = "<br><span style='color:#909399; font-size:18px;'>" + " / ".join(translations) + "</span>"
+            trans_html = f"<br><span style='color:#8c92a4; font-size:15px; font-weight:normal;'>{' / '.join(translations)}</span>"
             html += trans_html
         
         self.lbl_line_preview.setText(html)
-    
+
     def render_karaoke_html(self, line_text, current_pos_ms):
-        """渲染卡拉OK效果的HTML"""
-        # 移除开头的时间戳
         clean_text = re.sub(r'^\[\d{2}:\d{2}\.\d{2,3}\]', '', line_text)
-        
-        # 分割文本和时间戳
         parts = re.split(r'(\[\d{2}:\d{2}\.\d{2,3}\])', clean_text)
         
         html = ""
         current_time = 0
+        played_color = theme_manager.get_color("highlight_karaoke_played", "#67c23a")
+        unplayed_color = theme_manager.get_color("highlight_karaoke_unplayed", "#8c92a4")
         
         for part in parts:
-            if not part:
-                continue
-            
+            if not part: continue
             if re.match(r'^\[\d{2}:\d{2}\.\d{2,3}\]$', part):
-                # 这是时间戳
                 current_time = parse_time_tag(part)
             else:
-                # 这是文本
                 for char in part:
-                    # 判断字符状态
-                    if current_pos_ms >= current_time:
-                        # 已播放或正在播放
-                        color = "#67c23a"  # 绿色（已唱）
-                    else:
-                        # 未播放
-                        color = "#909399"  # 灰色
-                    
+                    color = played_color if current_pos_ms >= current_time else unplayed_color
                     html += f"<span style='color:{color};'>{char}</span>"
         
-        return html if html else "<span style='color:#909399;'>无歌词</span>"
+        return html if html else "<span style='color:#8c92a4;'>无歌词</span>"
+
+    def save_lrc(self):
+        lines = []
+        for r in range(self.table.rowCount()):
+            t = self.table.item(r, 0).text() if self.table.item(r, 0) else ""
+            c = self.table.item(r, 1).text() if self.table.item(r, 1) else ""
+            lines.append(f"{t}{c}")
+        self.result_lrc = "\n".join(lines)
+        self.accept()
     
+    def stop_and_release(self):
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+            self.player.stop()
+
+    def accept(self):
+        self.stop_and_release()
+        super().accept()
+        
+    def reject(self):
+        self.stop_and_release()
+        super().reject()
+
     def closeEvent(self, event):
         self.stop_and_release()
-        event.accept()
+        super().closeEvent(event)

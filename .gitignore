@@ -25,6 +25,9 @@ logs/
 # Models and data
 models/
 
+# Downloaded test data (large copyrighted audio files)
+testdata/
+
 # User-specific configuration files (not config.py - that's source code)
 settings.json
 

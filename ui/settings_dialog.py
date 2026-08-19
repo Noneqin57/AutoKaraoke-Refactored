@@ -1,21 +1,28 @@
 # -*- coding: utf-8 -*-
+"""
+应用设置对话框 (SettingsDialog)
+提供核心参数、文件路径与界面主题设置。
+"""
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                              QLineEdit, QPushButton, QFileDialog, QTabWidget, QWidget,
                              QComboBox, QSpinBox, QDoubleSpinBox, QCheckBox, QGroupBox, QFormLayout)
 from PyQt6.QtCore import Qt
 from config import LANGUAGES, PROMPT_DEFAULTS
+from ui.styles.theme_manager import theme_manager
 
 class SettingsDialog(QDialog):
     def __init__(self, config_manager, parent=None):
         super().__init__(parent)
         self.config_manager = config_manager
-        self.setWindowTitle("高级设置")
-        self.resize(600, 450)
+        self.setWindowTitle("系统设置 - AutoKaraoke")
+        self.resize(620, 480)
         self.setup_ui()
         self.load_settings()
 
     def setup_ui(self):
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(18, 16, 18, 16)
+        main_layout.setSpacing(14)
         
         self.tabs = QTabWidget()
         main_layout.addWidget(self.tabs)
@@ -23,6 +30,8 @@ class SettingsDialog(QDialog):
         # === 核心设置 Tab ===
         core_tab = QWidget()
         core_layout = QVBoxLayout(core_tab)
+        core_layout.setContentsMargins(14, 14, 14, 14)
+        core_layout.setSpacing(12)
         
         # 模型与语言
         model_group = QGroupBox("模型与语言")
@@ -34,7 +43,6 @@ class SettingsDialog(QDialog):
         model_form.addRow("Whisper 模型:", self.model_combo)
         
         self.lang_combo = QComboBox()
-        # 添加语言列表
         for code, name in LANGUAGES.items():
             self.lang_combo.addItem(name, code)
         self.lang_combo.setToolTip("请务必选择歌曲的主要语言。\nWhisper 对多语言混合的支持有限，请以主歌词语言为准。")
@@ -54,8 +62,8 @@ class SettingsDialog(QDialog):
         prompt_group.setLayout(prompt_lay)
         core_layout.addWidget(prompt_group)
         
-        # 偏移
-        offset_group = QGroupBox("时间偏移")
+        # 偏移与校准
+        offset_group = QGroupBox("时间偏移与对齐")
         offset_lay = QHBoxLayout()
         self.offset_spin = QSpinBox()
         self.offset_spin.setRange(-10000, 10000)
@@ -63,6 +71,7 @@ class SettingsDialog(QDialog):
         self.offset_spin.setToolTip("整体调整时间戳。\n正数: 时间延后; 负数: 时间提前。")
         offset_lay.addWidget(QLabel("全局偏移:"))
         offset_lay.addWidget(self.offset_spin)
+        
         self.calibration_spin = QDoubleSpinBox()
         self.calibration_spin.setRange(0.1, 10.0)
         self.calibration_spin.setSingleStep(0.1)
@@ -78,10 +87,22 @@ class SettingsDialog(QDialog):
         core_layout.addStretch()
         self.tabs.addTab(core_tab, "核心参数")
         
-        # === 路径与高级 Tab ===
-        path_tab = QWidget()
-        path_layout = QVBoxLayout(path_tab)
-        
+        # === 界面与外观 Tab ===
+        ui_tab = QWidget()
+        ui_layout = QVBoxLayout(ui_tab)
+        ui_layout.setContentsMargins(14, 14, 14, 14)
+        ui_layout.setSpacing(12)
+
+        theme_group = QGroupBox("界面外观")
+        theme_form = QFormLayout()
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("深色模式 (Dark)", "dark")
+        self.theme_combo.addItem("浅色模式 (Light)", "light")
+        self.theme_combo.currentIndexChanged.connect(self.on_theme_changed)
+        theme_form.addRow("主题风格:", self.theme_combo)
+        theme_group.setLayout(theme_form)
+        ui_layout.addWidget(theme_group)
+
         # 路径设置
         path_group = QGroupBox("文件路径")
         path_form = QFormLayout()
@@ -105,27 +126,33 @@ class SettingsDialog(QDialog):
         path_form.addRow("默认保存:", path_lay2)
         
         path_group.setLayout(path_form)
-        path_layout.addWidget(path_group)
+        ui_layout.addWidget(path_group)
         
         # 高级选项
-        adv_group = QGroupBox("高级选项")
+        adv_group = QGroupBox("性能选项")
         adv_lay = QVBoxLayout()
         self.check_release_vram = QCheckBox("任务结束后释放显存")
         self.check_release_vram.setChecked(True)
         self.check_release_vram.setToolTip("取消勾选可加快连续任务的处理速度，但会长期占用显存。")
         adv_lay.addWidget(self.check_release_vram)
         adv_group.setLayout(adv_lay)
-        path_layout.addWidget(adv_group)
+        ui_layout.addWidget(adv_group)
         
-        path_layout.addStretch()
-        self.tabs.addTab(path_tab, "路径与高级")
+        ui_layout.addStretch()
+        self.tabs.addTab(ui_tab, "外观与存储")
 
         # 底部按钮
         btn_box = QHBoxLayout()
         btn_save = QPushButton("保存设置")
+        btn_save.setObjectName("success")
+        btn_save.setMinimumHeight(34)
         btn_save.clicked.connect(self.save_settings)
+        
         btn_cancel = QPushButton("取消")
+        btn_cancel.setObjectName("secondary")
+        btn_cancel.setMinimumHeight(34)
         btn_cancel.clicked.connect(self.reject)
+        
         btn_box.addStretch()
         btn_box.addWidget(btn_save)
         btn_box.addWidget(btn_cancel)
@@ -143,14 +170,23 @@ class SettingsDialog(QDialog):
         self.offset_spin.setValue(self.config_manager.get("OFFSET") or 0)
         self.calibration_spin.setValue(float(self.config_manager.get("CALIBRATION_THRESHOLD") or 1.5))
         
-        # Path & Adv
+        # Appearance & Path
+        saved_theme = self.config_manager.get("THEME") or "dark"
+        t_index = self.theme_combo.findData(saved_theme)
+        if t_index >= 0:
+            self.theme_combo.setCurrentIndex(t_index)
+
         self.model_path_edit.setText(self.config_manager.get("MODEL_DIR") or "./models")
         self.output_path_edit.setText(self.config_manager.get("OUTPUT_DIR") or "")
         self.check_release_vram.setChecked(self.config_manager.get("RELEASE_VRAM", True) is not False)
 
+    def on_theme_changed(self, index):
+        theme_code = self.theme_combo.itemData(index)
+        if theme_code:
+            theme_manager.set_theme(theme_code)
+
     def on_lang_changed(self, text):
         lang_code = self.lang_combo.currentData()
-        # 如果当前prompt为空或者就是默认的，则自动更新
         current_prompt = self.prompt_edit.text().strip()
         is_default = False
         for p in PROMPT_DEFAULTS.values():
@@ -177,6 +213,10 @@ class SettingsDialog(QDialog):
         self.config_manager.set("OFFSET", self.offset_spin.value())
         self.config_manager.set("CALIBRATION_THRESHOLD", self.calibration_spin.value())
         
+        theme_code = self.theme_combo.currentData() or "dark"
+        self.config_manager.set("THEME", theme_code)
+        theme_manager.set_theme(theme_code)
+
         self.config_manager.set("MODEL_DIR", self.model_path_edit.text())
         self.config_manager.set("OUTPUT_DIR", self.output_path_edit.text())
         self.config_manager.set("RELEASE_VRAM", self.check_release_vram.isChecked())
