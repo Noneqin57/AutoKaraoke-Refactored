@@ -20,18 +20,19 @@ class EnhancedLrcHighlighter(QSyntaxHighlighter):
 
     def update_formats(self):
         is_dark = theme_manager.is_dark()
+        accent = theme_manager.accent_color
         
-        # 行级时间戳 [00:12.345]
+        # 行级时间戳 [00:12.345] -> 主色珊瑚粉
         self.line_time_format = QTextCharFormat()
-        self.line_time_format.setForeground(QColor("#409eff" if is_dark else "#1890ff"))
+        self.line_time_format.setForeground(QColor(accent))
         self.line_time_format.setFontWeight(QFont.Weight.Bold)
 
-        # 逐字内嵌时间戳 <00:12.345> 或内部的 [00:12.345]
+        # 逐字内嵌时间戳 <00:12.345> 或内部的 [00:12.345] -> 柔和薄荷绿
         self.word_time_format = QTextCharFormat()
-        self.word_time_format.setForeground(QColor("#67c23a" if is_dark else "#52c41a"))
+        self.word_time_format.setForeground(QColor("#67c23a" if is_dark else "#389e0d"))
         self.word_time_format.setFontWeight(QFont.Weight.Medium)
 
-        # 元数据标签 [ti:Song Title]
+        # 元数据标签 [ti:Song Title] -> 琥珀金
         self.tag_format = QTextCharFormat()
         self.tag_format.setForeground(QColor("#e6a23c" if is_dark else "#d46b08"))
         self.tag_format.setFontItalic(True)

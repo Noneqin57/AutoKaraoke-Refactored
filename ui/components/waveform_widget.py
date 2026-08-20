@@ -157,11 +157,12 @@ class WaveformWidget(QWidget):
             
             if hx2_clamp > hx1_clamp:
                 region_rect = QRectF(hx1_clamp, 0, hx2_clamp - hx1_clamp, h)
-                region_color = QColor(64, 158, 255, 40 if is_dark else 30)
+                accent_q = theme_manager.get_qcolor("accent_primary")
+                region_color = QColor(accent_q.red(), accent_q.green(), accent_q.blue(), 45 if is_dark else 35)
                 painter.fillRect(region_rect, region_color)
                 
                 # 选区左右边界高亮线
-                painter.setPen(QPen(QColor(64, 158, 255, 180), 1, Qt.PenStyle.SolidLine))
+                painter.setPen(QPen(QColor(accent_q.red(), accent_q.green(), accent_q.blue(), 200), 1.5, Qt.PenStyle.SolidLine))
                 if 0 <= hx1 <= w:
                     painter.drawLine(int(hx1), 0, int(hx1), h)
                 if 0 <= hx2 <= w:

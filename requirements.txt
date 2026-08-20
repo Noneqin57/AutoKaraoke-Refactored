@@ -1,7 +1,9 @@
 PyQt6>=6.4.0
+PyQt6-Fluent-Widgets>=1.11.0
 qtawesome>=1.2.0
 torch>=2.0.0
 torchaudio>=2.0.0
 stable-ts>=2.1.0
 openai-whisper>=20231117
 requests>=2.28.0
+

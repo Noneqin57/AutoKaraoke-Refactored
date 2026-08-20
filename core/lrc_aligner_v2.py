@@ -312,10 +312,25 @@ class LrcAligner:
         for seg in segments:
             if stop_event.is_set():
                 return ""
-            start = self._get_attr(seg, 'start', 0)
-            text = self._get_attr(seg, 'text', '').strip()
-            if text:
-                lines.append(f"[{format_time(start, self.time_offset)}]{text}")
+            words = self._get_attr(seg, 'words', [])
+            if words:
+                seg_line = ""
+                for w in words:
+                    w_text = self._get_attr(w, 'word', '')
+                    if not w_text:
+                        continue
+                    w_start = float(self._get_attr(w, 'start', 0.0) or 0.0)
+                    ts_str = format_time(w_start, self.time_offset)
+                    clean_w = w_text.strip()
+                    if clean_w:
+                        seg_line += f"[{ts_str}]{clean_w}"
+                if seg_line:
+                    lines.append(seg_line)
+            else:
+                start = self._get_attr(seg, 'start', 0)
+                text = self._get_attr(seg, 'text', '').strip()
+                if text:
+                    lines.append(f"[{format_time(start, self.time_offset)}]{text}")
         return "\n".join(lines)
 
     def _prepare_user_sequence(self) -> List[Dict[str, Any]]:
