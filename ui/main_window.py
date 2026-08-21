@@ -20,7 +20,8 @@ from qfluentwidgets import (FluentWindow, NavigationItemPosition, FluentIcon as 
 
 from config import TIMEOUT_CHECK_INTERVAL, ConfigManager
 from core.lrc_parser import LrcParser
-from core.whisper_worker import daemon_worker, WorkerArgs
+from core.worker_types import WorkerArgs
+from core.worker_launcher import daemon_worker_entry
 from core.worker_policy import decide_worker_recovery
 from ui.pages.generate_page import GeneratePage
 from ui.pages.model_page import ModelPage
@@ -112,10 +113,10 @@ class LyricsGenApp(FluentWindow):
         self.settings_page.theme_applied.connect(self.on_theme_applied)
 
     def init_worker(self):
-        """启动常驻后台推理守护进程"""
+        """启动常驻后台推理守护进程（经 torch-free 跳板，主进程不加载 torch）"""
         if self.worker_process is None or not self.worker_process.is_alive():
             self.worker_process = Process(
-                target=daemon_worker, 
+                target=daemon_worker_entry,
                 args=(self.task_queue, self.result_queue, self.progress_queue, self.stop_event)
             )
             self.worker_process.daemon = True
@@ -136,6 +137,9 @@ class LyricsGenApp(FluentWindow):
         ref_text = task_data["ref_text"]
         raw_lrc = task_data["raw_lrc_content"]
 
+        aligner_engine = task_data.get("aligner_engine", "whisper")
+        enable_vocal_sep = task_data.get("enable_vocal_separation", False)
+        vocal_model = task_data.get("vocal_model", "mel_band_roformer_vocals.ckpt")
         prompt = self.config_manager.get("PROMPT") or ""
         release_vram = self.config_manager.get("RELEASE_VRAM", True) is not False
         calibration_threshold = float(self.config_manager.get("CALIBRATION_THRESHOLD") or 1.5)
@@ -178,6 +182,9 @@ class LyricsGenApp(FluentWindow):
 
         args = WorkerArgs(
             audio_path=audio_path,
+            aligner_engine=aligner_engine,
+            enable_vocal_separation=enable_vocal_sep,
+            vocal_separation_model=vocal_model,
             model_size=model_size,
             language=lang_code,
             ref_text=ref_text,
@@ -313,7 +320,7 @@ class LyricsGenApp(FluentWindow):
     def open_editor(self, audio_path: str, lrc_text: str):
         if not audio_path or not lrc_text.strip():
             return
-            
+
         dialog = LrcEditorDialog(audio_path, lrc_text, self)
         if dialog.exec():
             if dialog.result_lrc:
@@ -325,6 +332,8 @@ class LyricsGenApp(FluentWindow):
                     position=InfoBarPosition.TOP_RIGHT,
                     duration=2500
                 )
+        # 编辑器自带 50ms 刷新 timer 与 QMediaPlayer，用完立即销毁避免累积泄漏
+        dialog.deleteLater()
 
     def save_lrc(self, content: str, encoding: str):
         audio_path = self.generate_page.audio_path

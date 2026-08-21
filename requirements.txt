@@ -6,4 +6,9 @@ torchaudio>=2.0.0
 stable-ts>=2.1.0
 openai-whisper>=20231117
 requests>=2.28.0
+pypinyin>=0.50.0
+pykakasi>=2.3.0
+audio-separator>=0.44.0
+audioread>=3.0.0
+
 

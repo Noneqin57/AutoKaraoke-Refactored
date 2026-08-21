@@ -1,4 +1,5 @@
 # -*- coding: utf-8 -*-
+# SPDX-License-Identifier: GPL-3.0-or-later
 
 import logging
 import os
@@ -14,6 +15,38 @@ MIN_DURATION = 0.06  # 最小时间间隔（秒）
 SEARCH_WINDOW = 20   # 搜索窗口大小
 TIMEOUT_CHECK_INTERVAL = 0.5  # 超时检查间隔（秒）
 CALIBRATION_THRESHOLD = 1.5  # 强制校准触发阈值（秒）
+
+# 对齐引擎列表
+ALIGNER_ENGINES = {
+    "whisper": "Whisper 引擎 (标准/转写)",
+    "ctc": "CTC 强制对齐 (歌声高精)"
+}
+
+# 人声提取模型注册表（单一数据源：UI 显示 / 模型下载 / 运行时解析共用，
+# 修改模型条目只改这里；键为 settings.json 中 VOCAL_MODEL 的存储值）
+VOCAL_MODEL_REGISTRY = {
+    "mel_band_roformer_vocals.ckpt": {
+        "filename": "model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+        "label": "Mel-Band RoFormer (人声增强·推荐)",
+        "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_mel_band_roformer_ep_3005_sdr_11.4360.ckpt",
+        "size_mb": 820.0,
+    },
+    "BS-Roformer-Viperx-1297.ckpt": {
+        "filename": "model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "label": "BS-RoFormer (极致精度·SDR领先)",
+        "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/model_bs_roformer_ep_317_sdr_12.9755.ckpt",
+        "size_mb": 640.0,
+    },
+    "UVR-MDX-NET-Inst_HQ_3.onnx": {
+        "filename": "UVR-MDX-NET-Inst_HQ_3.onnx",
+        "label": "MDX-Net Inst HQ 3 (轻量极速·低显存)",
+        "url": "https://github.com/TRvlvr/model_repo/releases/download/all_public_uvr_models/UVR-MDX-NET-Inst_HQ_3.onnx",
+        "size_mb": 60.0,
+    },
+}
+# 人声提取模型列表 (MSST / RoFormer / UVR 系列)：供 UI 下拉框使用（键 → 显示名）
+VOCAL_MODELS = {key: meta["label"] for key, meta in VOCAL_MODEL_REGISTRY.items()}
+DEFAULT_VOCAL_MODEL = "mel_band_roformer_vocals.ckpt"
 
 # 完整语言列表 (Whisper支持的主要语言)
 LANGUAGES = {
@@ -136,6 +169,9 @@ class ConfigManager:
             默认配置字典
         """
         return {
+            "ALIGNER_ENGINE": "whisper",
+            "ENABLE_VOCAL_SEPARATION": False,
+            "VOCAL_MODEL": DEFAULT_VOCAL_MODEL,
             "MODEL_SIZE": "large-v2",
             "LANGUAGE": "ja",
             "PROMPT": "",

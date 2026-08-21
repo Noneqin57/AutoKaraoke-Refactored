@@ -1,0 +1,6 @@
+# 后端 CI / 本地测试依赖（不含 torch / PyQt6 / QFluentWidgets）
+# CI 工作流 (.github/workflows/backend.yml) 安装本文件后跑 `pytest tests`
+# 注意：CI 不装 torch，依赖 core/ctc_aligner.py、core/vocal_separator.py 的
+# torch import 守卫（try/except）才能在不含 torch 的环境中正常导入并测试。
+pytest>=7.0
+requests>=2.28

@@ -7,10 +7,13 @@ import logging
 from dataclasses import dataclass
 from typing import List, Optional, Callable
 
+from config import VOCAL_MODEL_REGISTRY
+
 logger = logging.getLogger(__name__)
 
 class ModelType:
     ORIGINAL_WHISPER = "Original Whisper"
+    MSST_VOCAL = "MSST Vocal Separation"
 
 class DownloadStopped(Exception):
     """用户主动停止下载。"""
@@ -39,6 +42,17 @@ ORIGINAL_WHISPER_MODELS = {
     "large-v3": "https://openaipublic.azureedge.net/main/whisper/models/e5b1a55b89c1367dacf97e3e19bfd829a0153013067238c38a0f603f08faf288/large-v3.pt"
 }
 
+# Mapping for MSST / RoFormer / UVR Vocal Separation Models
+# 派生自 config.VOCAL_MODEL_REGISTRY（单一数据源），此处仅保留下载所需字段
+MSST_VOCAL_MODELS = {
+    key: {
+        "filename": meta["filename"],
+        "url": meta["url"],
+        "size_mb": meta["size_mb"],
+    }
+    for key, meta in VOCAL_MODEL_REGISTRY.items()
+}
+
 class ModelManager:
     def __init__(self, base_dir: str):
         self.base_dir = base_dir
@@ -48,7 +62,7 @@ class ModelManager:
     def get_model_list(self) -> List[ModelInfo]:
         models = []
         
-        # Original Whisper Models
+        # 1. Original Whisper Models
         for name, url in ORIGINAL_WHISPER_MODELS.items():
             local_path = os.path.join(self.base_dir, f"{name}.pt")
             is_downloaded = (
@@ -56,8 +70,6 @@ class ModelManager:
                 and os.path.getsize(local_path) > 1024 * 1024
                 and not os.path.exists(local_path + ".part")
             )
-            # Could check file size/hash if we want to be strict
-            
             models.append(ModelInfo(
                 name=name,
                 type=ModelType.ORIGINAL_WHISPER,
@@ -67,6 +79,25 @@ class ModelManager:
                 is_downloaded=is_downloaded
             ))
             
+        # 2. MSST Vocal Separation Models
+        vocal_dir = os.path.join(self.base_dir, "vocal_models")
+        for key, meta in MSST_VOCAL_MODELS.items():
+            local_path = os.path.join(vocal_dir, meta["filename"])
+            is_downloaded = (
+                os.path.isfile(local_path)
+                and os.path.getsize(local_path) > 1024 * 1024
+                and not os.path.exists(local_path + ".part")
+            )
+            models.append(ModelInfo(
+                name=meta["filename"],
+                type=ModelType.MSST_VOCAL,
+                key=key,
+                repo_id_or_url=meta["url"],
+                local_path=local_path,
+                size_mb=meta.get("size_mb", 0),
+                is_downloaded=is_downloaded
+            ))
+
         return models
 
     def delete_model(self, model_info: ModelInfo):
@@ -193,7 +224,6 @@ class ModelDownloader:
 
     def _download_url(self):
         """带重试的 URL 下载入口，内部调用 _download_url_once。"""
-        url = self.model.repo_id_or_url
         dest = self.model.local_path
 
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -213,25 +243,21 @@ class ModelDownloader:
                 time.sleep(1)
 
         if self.stop_flag:
-            try:
-                os.remove(dest)
-            except OSError:
-                pass
-            try:
-                os.remove(dest + ".part")
-            except OSError:
-                pass
+            # 只清理未完成的 .part；保留 dest 处已存在的完整模型，避免误删
+            self._remove_part_file(dest)
             raise DownloadStopped("已暂停")
-            return
 
-        # 3 次失败后清理残留的临时文件
+        # 3 次失败后清理残留的 .part 临时文件（同样保留已存在的完整旧模型）
+        self._remove_part_file(dest)
+
+        logger.error("Model download failed after 3 attempts: %s", last_error)
+        raise last_error if last_error else Exception("Download failed")
+
+    @staticmethod
+    def _remove_part_file(dest: str):
+        """清理下载残留的 .part 临时文件（不触碰已完成的模型文件）。"""
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
             if os.path.exists(dest + ".part"):
                 os.remove(dest + ".part")
         except OSError:
             pass
-
-        logger.error("Model download failed after 3 attempts: %s", last_error)
-        raise last_error if last_error else Exception("Download failed")

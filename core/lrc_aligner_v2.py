@@ -147,14 +147,21 @@ class LrcAligner:
                 is_force_calibrated = False
 
                 if not valid_times:
-                    logger.warning(
-                        f"Line {i + 1} [Original: {original_ts}s] has NO generated "
-                        f"timestamp. Forcing fallback."
-                    )
-                    for k, t in enumerate(line_tokens):
-                        t['time'] = original_ts + (k * 0.25)
-                    current_last_time = line_tokens[-1]['time']
-                    is_force_calibrated = True
+                    if line_tokens:
+                        logger.warning(
+                            f"Line {i + 1} [Original: {original_ts}s] has NO generated "
+                            f"timestamp. Forcing fallback."
+                        )
+                        for k, t in enumerate(line_tokens):
+                            t['time'] = original_ts + (k * 0.25)
+                        current_last_time = line_tokens[-1]['time']
+                        is_force_calibrated = True
+                    else:
+                        # 整行没有任何可打轴 token（如纯标点行）：保持原样输出
+                        logger.warning(
+                            f"Line {i + 1} [Original: {original_ts}s] has no tokens "
+                            f"(punctuation-only line?). Skipping force calibration."
+                        )
                 else:
                     generated_start = valid_times[0]
                     diff = generated_start - original_ts
@@ -174,8 +181,8 @@ class LrcAligner:
                             current_last_time = line_tokens[-1]['time']
                         is_force_calibrated = True
 
-                # 强制边界检查：本行末尾不能越过下一行
-                if not self.enable_avg_distribution and next_line_start:
+                # 强制边界检查：本行末尾不能越过下一行（空 token 行跳过）
+                if not self.enable_avg_distribution and next_line_start and line_tokens:
                     last_token = line_tokens[-1]
                     if (
                         last_token['time']

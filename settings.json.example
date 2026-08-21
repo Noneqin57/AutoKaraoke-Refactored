@@ -1,4 +1,7 @@
 {
+    "ALIGNER_ENGINE": "whisper",
+    "ENABLE_VOCAL_SEPARATION": false,
+    "VOCAL_MODEL": "mel_band_roformer_vocals.ckpt",
     "MODEL_DIR": "./models",
     "OUTPUT_DIR": "./LRC",
     "MODEL_SIZE": "large-v2",

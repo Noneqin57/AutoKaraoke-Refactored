@@ -14,7 +14,8 @@ from qfluentwidgets import (CardWidget, PrimaryPushButton, PushButton,
                             CaptionLabel, StrongBodyLabel, InfoBar, 
                             InfoBarPosition, SmoothScrollArea)
 
-from config import LANGUAGES, PROMPT_DEFAULTS, ConfigManager
+from config import (LANGUAGES, ALIGNER_ENGINES, VOCAL_MODELS, 
+                    DEFAULT_VOCAL_MODEL, PROMPT_DEFAULTS, ConfigManager)
 from ui.styles.theme_manager import theme_manager
 
 class SettingsPage(QWidget):
@@ -57,8 +58,16 @@ class SettingsPage(QWidget):
 
         c_lay.addWidget(StrongBodyLabel("默认识别与对齐参数"))
 
-        # 模型 & 语言
+        # 引擎 & 模型 & 语言
         row1 = QHBoxLayout()
+        e_box = QVBoxLayout()
+        e_box.addWidget(CaptionLabel("默认对齐引擎"))
+        self.engine_combo = ComboBox(core_card)
+        for code, name in ALIGNER_ENGINES.items():
+            self.engine_combo.addItem(name, userData=code)
+        e_box.addWidget(self.engine_combo)
+        row1.addLayout(e_box, 1)
+
         m_box = QVBoxLayout()
         m_box.addWidget(CaptionLabel("默认模型"))
         self.model_combo = ComboBox(core_card)
@@ -103,6 +112,26 @@ class SettingsPage(QWidget):
         t_box.addWidget(self.calibration_spin)
         row2.addLayout(t_box, 1)
         c_lay.addLayout(row2)
+
+        # 人声提取配置
+        row_vocal = QHBoxLayout()
+        v_sw_box = QVBoxLayout()
+        v_sw_box.addWidget(CaptionLabel("默认开启人声提取 (MSST)"))
+        self.sw_vocal_sep = SwitchButton("人声分离", core_card)
+        self.sw_vocal_sep.setChecked(False)
+        v_sw_box.addWidget(self.sw_vocal_sep)
+        row_vocal.addLayout(v_sw_box, 1)
+
+        v_m_box = QVBoxLayout()
+        v_m_box.addWidget(CaptionLabel("默认人声提取模型"))
+        self.vocal_model_combo = ComboBox(core_card)
+        for code, name in VOCAL_MODELS.items():
+            self.vocal_model_combo.addItem(name, userData=code)
+        self.vocal_model_combo.setEnabled(False)
+        self.sw_vocal_sep.checkedChanged.connect(self.vocal_model_combo.setEnabled)
+        v_m_box.addWidget(self.vocal_model_combo)
+        row_vocal.addLayout(v_m_box, 2)
+        c_lay.addLayout(row_vocal)
 
         lay.addWidget(core_card)
 
@@ -184,6 +213,24 @@ class SettingsPage(QWidget):
         main_lay.addWidget(scroll)
 
     def load_settings(self):
+        # 引擎
+        engine = self.config_manager.get("ALIGNER_ENGINE") or "whisper"
+        for i in range(self.engine_combo.count()):
+            if self.engine_combo.itemData(i) == engine:
+                self.engine_combo.setCurrentIndex(i)
+                break
+
+        # 人声提取
+        vocal_sep = bool(self.config_manager.get("ENABLE_VOCAL_SEPARATION", False))
+        self.sw_vocal_sep.setChecked(vocal_sep)
+        self.vocal_model_combo.setEnabled(vocal_sep)
+
+        vocal_model = self.config_manager.get("VOCAL_MODEL") or DEFAULT_VOCAL_MODEL
+        for i in range(self.vocal_model_combo.count()):
+            if self.vocal_model_combo.itemData(i) == vocal_model:
+                self.vocal_model_combo.setCurrentIndex(i)
+                break
+
         # 模型
         model = self.config_manager.get("MODEL_SIZE") or "large-v2"
         idx = self.model_combo.findText(model)
@@ -244,6 +291,9 @@ class SettingsPage(QWidget):
             self.output_dir_edit.setText(d)
 
     def save_settings(self):
+        self.config_manager.set("ALIGNER_ENGINE", self.engine_combo.currentData())
+        self.config_manager.set("ENABLE_VOCAL_SEPARATION", self.sw_vocal_sep.isChecked())
+        self.config_manager.set("VOCAL_MODEL", self.vocal_model_combo.currentData() or DEFAULT_VOCAL_MODEL)
         self.config_manager.set("MODEL_SIZE", self.model_combo.currentText())
         self.config_manager.set("LANGUAGE", self.lang_combo.currentData())
         self.config_manager.set("PROMPT", self.prompt_edit.text().strip())
@@ -264,6 +314,16 @@ class SettingsPage(QWidget):
         )
 
     def reset_defaults(self):
+        for i in range(self.engine_combo.count()):
+            if self.engine_combo.itemData(i) == "whisper":
+                self.engine_combo.setCurrentIndex(i)
+                break
+        self.sw_vocal_sep.setChecked(False)
+        self.vocal_model_combo.setEnabled(False)
+        for i in range(self.vocal_model_combo.count()):
+            if self.vocal_model_combo.itemData(i) == DEFAULT_VOCAL_MODEL:
+                self.vocal_model_combo.setCurrentIndex(i)
+                break
         self.model_combo.setCurrentText("large-v2")
         for i in range(self.lang_combo.count()):
             if self.lang_combo.itemData(i) == "ja":

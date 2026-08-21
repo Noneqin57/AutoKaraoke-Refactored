@@ -5,6 +5,9 @@
 音频拖拽、双栏歌词对比、参数快捷配置与进度展示。
 """
 import os
+import sys
+import ctypes
+import ctypes.util
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTextEdit, QSplitter, QFileDialog)
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -16,7 +19,7 @@ from qfluentwidgets import (CardWidget, PrimaryPushButton, PushButton,
                             TitleLabel, SubtitleLabel, BodyLabel, CaptionLabel, 
                             StrongBodyLabel, InfoBadge, InfoBar, InfoBarPosition, IconWidget)
 
-from config import LANGUAGES, ConfigManager
+from config import LANGUAGES, ALIGNER_ENGINES, VOCAL_MODELS, DEFAULT_VOCAL_MODEL, ConfigManager
 from core.lrc_parser import LrcParser
 from ui.components.lrc_highlighter import EnhancedLrcHighlighter
 from ui.styles.theme_manager import theme_manager
@@ -88,10 +91,14 @@ class GeneratePage(QWidget):
 
     @staticmethod
     def _is_cuda_available() -> bool:
+        """轻量探测 NVIDIA CUDA 运行时（ctypes），避免在 UI 主进程加载 torch。"""
         try:
-            import torch
-            return bool(torch.cuda.is_available())
-        except Exception:
+            if sys.platform == "win32":
+                ctypes.CDLL("nvcuda.dll")
+                return True
+            lib = ctypes.util.find_library("cuda")
+            return lib is not None
+        except OSError:
             return False
 
     def _build_audio_card(self) -> CardWidget:
@@ -188,6 +195,16 @@ class GeneratePage(QWidget):
         lay.setContentsMargins(18, 12, 18, 12)
         lay.setSpacing(20)
 
+        # 0. 对齐引擎选择
+        e_box = QVBoxLayout()
+        e_box.setSpacing(4)
+        e_box.addWidget(CaptionLabel("对齐引擎"))
+        self.engine_combo = ComboBox(self)
+        for code, name in ALIGNER_ENGINES.items():
+            self.engine_combo.addItem(name, userData=code)
+        e_box.addWidget(self.engine_combo)
+        lay.addLayout(e_box, 2)
+
         # 1. 模型选择
         m_box = QVBoxLayout()
         m_box.setSpacing(4)
@@ -204,7 +221,26 @@ class GeneratePage(QWidget):
         m_box.addWidget(self.model_combo)
         lay.addLayout(m_box, 2)
 
-        # 2. 识别语言
+        # 2. 人声提取预处理 (MSST / RoFormer)
+        v_box = QVBoxLayout()
+        v_box.setSpacing(4)
+        v_box.addWidget(CaptionLabel("人声提取 (MSST)"))
+        
+        v_sub_lay = QHBoxLayout()
+        self.sw_vocal_sep = SwitchButton("启用", self)
+        self.sw_vocal_sep.setChecked(False)
+        self.vocal_combo = ComboBox(self)
+        for code, name in VOCAL_MODELS.items():
+            self.vocal_combo.addItem(name, userData=code)
+        self.vocal_combo.setEnabled(False)
+        self.sw_vocal_sep.checkedChanged.connect(self.vocal_combo.setEnabled)
+        
+        v_sub_lay.addWidget(self.sw_vocal_sep)
+        v_sub_lay.addWidget(self.vocal_combo, 1)
+        v_box.addLayout(v_sub_lay)
+        lay.addLayout(v_box, 2)
+
+        # 3. 识别语言
         l_box = QVBoxLayout()
         l_box.setSpacing(4)
         l_box.addWidget(CaptionLabel("主要语言"))
@@ -214,7 +250,7 @@ class GeneratePage(QWidget):
         l_box.addWidget(self.lang_combo)
         lay.addLayout(l_box, 2)
 
-        # 3. 时间偏移
+        # 4. 时间偏移
         o_box = QVBoxLayout()
         o_box.setSpacing(4)
         o_box.addWidget(CaptionLabel("全局偏移 (秒)"))
@@ -225,7 +261,7 @@ class GeneratePage(QWidget):
         o_box.addWidget(self.offset_spin)
         lay.addLayout(o_box, 1)
 
-        # 4. 开关组
+        # 5. 开关组
         t_box = QVBoxLayout()
         t_box.setSpacing(4)
         t_box.addWidget(CaptionLabel("校准策略"))
@@ -289,6 +325,22 @@ class GeneratePage(QWidget):
         return card
 
     def load_config_defaults(self):
+        saved_engine = self.config_manager.get("ALIGNER_ENGINE") or "whisper"
+        for i in range(self.engine_combo.count()):
+            if self.engine_combo.itemData(i) == saved_engine:
+                self.engine_combo.setCurrentIndex(i)
+                break
+
+        saved_vocal_sep = bool(self.config_manager.get("ENABLE_VOCAL_SEPARATION", False))
+        self.sw_vocal_sep.setChecked(saved_vocal_sep)
+        self.vocal_combo.setEnabled(saved_vocal_sep)
+
+        saved_vocal_model = self.config_manager.get("VOCAL_MODEL") or DEFAULT_VOCAL_MODEL
+        for i in range(self.vocal_combo.count()):
+            if self.vocal_combo.itemData(i) == saved_vocal_model:
+                self.vocal_combo.setCurrentIndex(i)
+                break
+
         saved_model = self.config_manager.get("MODEL_SIZE") or "large-v2"
         for i in range(self.model_combo.count()):
             if saved_model in self.model_combo.itemText(i):
@@ -310,7 +362,7 @@ class GeneratePage(QWidget):
     def _on_input_text_changed(self):
         text = self.input_txt.toPlainText().strip()
         if text:
-            self.subtitle_lbl.setText("当前模式：【强制对齐】· 依据左侧歌词底稿进行 Whisper 毫秒级打轴")
+            self.subtitle_lbl.setText("当前模式：【强制对齐】· 依据左侧歌词底稿进行 Whisper/CTC 毫秒级打轴")
         else:
             self.subtitle_lbl.setText("当前模式：【语音识别】· 纯音频全曲听写转写，生成逐字歌词")
 
@@ -376,6 +428,10 @@ class GeneratePage(QWidget):
             )
             return
 
+        aligner_engine = self.engine_combo.currentData() or "whisper"
+        enable_vocal_sep = self.sw_vocal_sep.isChecked()
+        vocal_model = self.vocal_combo.currentData() or DEFAULT_VOCAL_MODEL
+
         model_text = self.model_combo.currentText()
         model_size = "large-v2"
         for candidate in ["large-v3", "large-v2", "medium", "small", "base", "tiny"]:
@@ -391,6 +447,9 @@ class GeneratePage(QWidget):
 
         task_data = {
             "audio_path": self.audio_path,
+            "aligner_engine": aligner_engine,
+            "enable_vocal_separation": enable_vocal_sep,
+            "vocal_model": vocal_model,
             "model_size": model_size,
             "language": lang,
             "offset": offset,

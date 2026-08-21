@@ -11,7 +11,10 @@ from multiprocessing import Queue, Event
 
 from core.lrc_parser import LrcParser
 from core.lrc_aligner_v2 import LrcAligner
+from core.ctc_aligner import CTCAligner
+from core.vocal_separator import VocalSeparator
 
+from config import DEFAULT_VOCAL_MODEL
 from utils.logger_v2 import setup_logger
 
 from core.worker_types import WorkerArgs
@@ -154,71 +157,114 @@ def run_inference_task(args: WorkerArgs, result_queue: Queue, progress_queue: Qu
         device = "cuda" if is_cuda else "cpu"
         progress_queue.put(f"运行设备: {device.upper()}")
         logger.info(f"Device: {device}")
+        
+        # 1. 前置人声提取（MSST / RoFormer）
+        align_target_audio = audio_path
+        enable_vocal_sep = getattr(args, "enable_vocal_separation", False)
+        vocal_model_name = getattr(args, "vocal_separation_model", DEFAULT_VOCAL_MODEL)
 
-        model = None
-        
-        # 使用模型缓存管理器
-        if _model_cache.is_cached(model_size):
-            logger.info("Using cached model.")
-            model, _ = _model_cache.get()
-            progress_queue.put(f"使用缓存模型 ({model_size})")
-        else:
-            cached_model, cached_size = _model_cache.get()
-            if cached_model:
-                logger.info(f"Model mismatch (cached: {cached_size}, req: {model_size}). Clearing cache.")
-                progress_queue.put("切换模型中，释放旧模型显存...")
-                _model_cache.clear(force=True)
-        
-        # 加载新模型（原版 OpenAI Whisper，stable-whisper 封装）
-        if not model:
+        if enable_vocal_sep:
+            logger.info("Vocal separation enabled. Model: %s", vocal_model_name)
+            vocal_model_dir = os.path.join(local_model_path, "vocal_models")
+            vocal_sep = VocalSeparator(
+                model_dir=vocal_model_dir,
+                model_name=vocal_model_name,
+                device=device
+            )
             try:
-                if not stop_event.is_set():
-                    progress_queue.put(f"加载模型 ({model_size})...")
-                    progress_queue.put("PROGRESS:10")
-                    model = stable_whisper.load_model(model_size, download_root=local_model_path, device=device)
+                extracted_vocal_path = vocal_sep.separate(
+                    audio_path=audio_path,
+                    progress_queue=progress_queue,
+                    stop_event=stop_event
+                )
+                if stop_event.is_set():
+                    result_queue.put(("aborted", None))
+                    return
+                if extracted_vocal_path and os.path.exists(extracted_vocal_path):
+                    align_target_audio = extracted_vocal_path
+                    logger.info("Using separated vocals for alignment: %s", align_target_audio)
+            finally:
+                # 分离完成后立即释放分离器显存，确保后续对齐模型有足够显存
+                vocal_sep.release()
 
-                # 更新缓存
-                if model is not None and not release_vram_flag:
-                    _model_cache.set(model, model_size)
-                    
-            except Exception as e:
-                raise RuntimeError(f"模型加载失败: {str(e)}")
-            
-        # 语言参数处理
-        lang_param = language 
-        # 移除 Auto 检测逻辑，因为 UI 已经强制选择了语言
-        
-        progress_queue.put("PROGRESS:30")
+        aligner_engine = getattr(args, "aligner_engine", "whisper")
+        logger.info(f"Selected aligner engine: {aligner_engine}")
         result = None
-        if stop_event.is_set():
-            result_queue.put(("aborted", None))
-            return
-        
-        if ref_text and ref_text.strip():
-            progress_queue.put("正在进行【结构化强制对齐】...")
-            spaced_ref_text = preprocess_cjk_spaces(ref_text)
-            
-            # 使用更严格的参数调用 align
-            # 注意: vad=True 需要下载 Silero VAD 模型，如果网络不通会导致 502/ConnectTimeout
-            # 这里我们先禁用 vad 参数以确保国内网络下的稳定性，
-            # 依靠 suppress_silence 和全局对齐算法来处理静音。
-            align_args = {
-                "language": lang_param, 
-                "suppress_silence": True, 
-                "regroup": False
-            }
-            
-            # 只有当确实已经下载了 VAD 模型或者网络环境允许时才建议开启 vad=True
-            # result = model.align(audio_path, spaced_ref_text, **align_args)
 
-            result = model.align(audio_path, spaced_ref_text, **align_args)
+        if aligner_engine == "ctc" and ref_text and ref_text.strip():
+            progress_queue.put("正在使用【CTC 歌声强制对齐】引擎...")
+            progress_queue.put("PROGRESS:35" if enable_vocal_sep else "PROGRESS:15")
+            ctc_aligner = CTCAligner(device=device)
+            try:
+                result = ctc_aligner.align(
+                    audio_path=align_target_audio,
+                    parser=parser,
+                    ref_text=ref_text,
+                    stop_event=stop_event,
+                    progress_queue=progress_queue,
+                    time_offset=time_offset
+                )
+            finally:
+                if release_vram_flag:
+                    ctc_aligner.release()
         else:
-            progress_queue.put("正在进行语音识别...")
-            transcribe_args = {"language": lang_param, "word_timestamps": True, "vad": True, "regroup": False}
-            if initial_prompt_input and initial_prompt_input.strip():
-                transcribe_args["initial_prompt"] = initial_prompt_input.strip()
+            if aligner_engine == "ctc" and (not ref_text or not ref_text.strip()):
+                progress_queue.put("未检测到底稿文本，CTC 模式自动切换至 Whisper 语音识别...")
+
+            model = None
             
-            result = model.transcribe(audio_path, **transcribe_args)
+            # 使用模型缓存管理器
+            if _model_cache.is_cached(model_size):
+                logger.info("Using cached model.")
+                model, _ = _model_cache.get()
+                progress_queue.put(f"使用缓存模型 ({model_size})")
+            else:
+                cached_model, cached_size = _model_cache.get()
+                if cached_model:
+                    logger.info(f"Model mismatch (cached: {cached_size}, req: {model_size}). Clearing cache.")
+                    progress_queue.put("切换模型中，释放旧模型显存...")
+                    _model_cache.clear(force=True)
+            
+            # 加载新模型（原版 OpenAI Whisper，stable-whisper 封装）
+            if not model:
+                try:
+                    if not stop_event.is_set():
+                        progress_queue.put(f"加载模型 ({model_size})...")
+                        progress_queue.put("PROGRESS:40" if enable_vocal_sep else "PROGRESS:10")
+                        model = stable_whisper.load_model(model_size, download_root=local_model_path, device=device)
+
+                    # 更新缓存
+                    if model is not None and not release_vram_flag:
+                        _model_cache.set(model, model_size)
+                        
+                except Exception as e:
+                    raise RuntimeError(f"模型加载失败: {str(e)}")
+                
+            # 语言参数处理
+            lang_param = language 
+            
+            progress_queue.put("PROGRESS:55" if enable_vocal_sep else "PROGRESS:30")
+            if stop_event.is_set():
+                result_queue.put(("aborted", None))
+                return
+            
+            if ref_text and ref_text.strip():
+                progress_queue.put("正在进行【结构化强制对齐】...")
+                spaced_ref_text = preprocess_cjk_spaces(ref_text)
+                
+                align_args = {
+                    "language": lang_param, 
+                    "suppress_silence": True, 
+                    "regroup": False
+                }
+                result = model.align(align_target_audio, spaced_ref_text, **align_args)
+            else:
+                progress_queue.put("正在进行语音识别...")
+                transcribe_args = {"language": lang_param, "word_timestamps": True, "vad": True, "regroup": False}
+                if initial_prompt_input and initial_prompt_input.strip():
+                    transcribe_args["initial_prompt"] = initial_prompt_input.strip()
+                
+                result = model.transcribe(align_target_audio, **transcribe_args)
         
         if stop_event.is_set():
             result_queue.put(("aborted", None))

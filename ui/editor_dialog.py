@@ -417,7 +417,7 @@ class LrcEditorDialog(QDialog):
             self.update_play_button_text()
             
         editor = WordLevelEditor(self.audio_path, text_content, start_ms, end_ms, self)
-        
+
         if editor.exec():
             if editor.result_start_time:
                 self.table.setItem(row, 0, QTableWidgetItem(editor.result_start_time))
@@ -425,6 +425,8 @@ class LrcEditorDialog(QDialog):
                 self.table.setItem(row, 1, QTableWidgetItem(editor.result_lrc_content))
             self.cache_timestamps()
             self.refresh_playback_view()
+        # 编辑器自带 40ms 刷新 timer 与 QMediaPlayer，用完立即销毁避免累积泄漏
+        editor.deleteLater()
 
     # === 时间轴偏移工具箱逻辑 ===
     def get_target_rows_for_offset(self) -> list:
@@ -689,23 +691,26 @@ class LrcEditorDialog(QDialog):
 
     def update_line_preview(self, current_pos_ms):
         current_row = -1
+        current_line_start_ms = 0
         for i, (row, start_ms) in enumerate(self.cached_timestamps):
             if start_ms < 0 or row in self.translation_rows:
                 continue
-            
+
             end_ms = None
             for j in range(i + 1, len(self.cached_timestamps)):
                 if self.cached_timestamps[j][0] not in self.translation_rows and self.cached_timestamps[j][1] > 0:
                     end_ms = self.cached_timestamps[j][1]
                     break
-            
+
             if end_ms is None:
                 if current_pos_ms >= start_ms:
                     current_row = row
+                    current_line_start_ms = start_ms
                     break
             else:
                 if start_ms <= current_pos_ms < end_ms:
                     current_row = row
+                    current_line_start_ms = start_ms
                     break
         
         if current_row < 0:
@@ -728,7 +733,7 @@ class LrcEditorDialog(QDialog):
                     translations.append(trans_text_item.text())
         
         if '[' in line_text and ']' in line_text and re.search(r'\[\d{2}:\d{2}\.\d{2,3}\]', line_text):
-            html = self.render_karaoke_html(line_text, current_pos_ms)
+            html = self.render_karaoke_html(line_text, current_pos_ms, current_line_start_ms)
         else:
             active_color = theme_manager.get_color("highlight_karaoke_played", "#67c23a")
             html = f"<span style='color:{active_color};'>{line_text}</span>"
@@ -739,15 +744,22 @@ class LrcEditorDialog(QDialog):
         
         self.lbl_line_preview.setText(html)
 
-    def render_karaoke_html(self, line_text, current_pos_ms):
-        clean_text = re.sub(r'^\[\d{2}:\d{2}\.\d{2,3}\]', '', line_text)
+    def render_karaoke_html(self, line_text, current_pos_ms, line_start_ms=0):
+        # 行首若带时间标签则作为首字的起始时间；否则用行时间戳列的起点，
+        # 避免首字因初始 current_time=0 而恒显示为「已唱」
+        lead = re.match(r'^\[\d{2}:\d{2}\.\d{2,3}\]', line_text)
+        if lead:
+            current_time = parse_time_tag(lead.group(0))
+            clean_text = line_text[lead.end():]
+        else:
+            current_time = line_start_ms
+            clean_text = line_text
         parts = re.split(r'(\[\d{2}:\d{2}\.\d{2,3}\])', clean_text)
-        
+
         html = ""
-        current_time = 0
         played_color = theme_manager.get_color("highlight_karaoke_played", "#67c23a")
         unplayed_color = theme_manager.get_color("highlight_karaoke_unplayed", "#8c92a4")
-        
+
         for part in parts:
             if not part: continue
             if re.match(r'^\[\d{2}:\d{2}\.\d{2,3}\]$', part):
@@ -769,13 +781,15 @@ class LrcEditorDialog(QDialog):
         self.accept()
     
     def stop_and_release(self):
+        # 停止刷新定时器，避免对话框关闭后 timer 持续空转
+        self.timer.stop()
         if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
             self.player.stop()
 
     def accept(self):
         self.stop_and_release()
         super().accept()
-        
+
     def reject(self):
         self.stop_and_release()
         super().reject()

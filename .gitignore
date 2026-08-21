@@ -5,9 +5,6 @@ __pycache__/
 
 # Virtual environments
 .venv/
-packaging_env/
-venv/
-env/
 
 # IDE files
 .idea/
@@ -40,11 +37,13 @@ settings.json
 build/
 plan/
 LRC/
+dist/
+output/
+tools/
 
 # Python testing / packaging
 .pytest_cache/
 htmlcov/
 .coverage
 *.egg-info/
-dist/
 AGENTS.md

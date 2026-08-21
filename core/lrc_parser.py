@@ -9,11 +9,16 @@ class LrcParser:
         self.lines_text: List[str] = []
         self.translations: Dict[int, List[str]] = {}
         self.lines_timestamps: List[float] = [] # 存储每一行的原始时间戳 (秒)
-        # 匹配制作人信息等非歌词行
+        # 匹配制作人信息等非歌词行。
+        # 判定条件收紧为「角色前缀（1-4 个角色字/英文前缀词）后紧跟冒号」，
+        # 避免把以「和/唱/词」等字开头、40 字内含空格的普通歌词行误判为制作信息。
+        _role_chars = "作詞词曲編编演唄唱混錄录母帶带制監监統筹统出繪绘調调畫画和聲声吉他貝贝鼓絃弦樂乐管奏"
         self.credits_pattern = re.compile(
-            r"^(作|编|词|曲|演|唱|混|录|母|制|监|统|出|绘|调|和|吉|贝|鼓|弦|管|Lyr|Com|Arr|Sin|Voc|Mix|Mas|Pro|Art|Cov|Gui|Bas|Dru|Str)"
-            r".{0,40}"
-            r"([:：]|\s|-)", re.IGNORECASE
+            r"^(?:[" + _role_chars + r"]{1,4}"
+            r"(?:\s*[／/・·&、]\s*[" + _role_chars + r"]{1,4})*"
+            r"|(?:Lyr|Com|Arr|Sin|Voc|Mix|Mas|Pro|Art|Cov|Gui|Bas|Dru|Str)[A-Za-z]*)"
+            r"\s*[:：]",
+            re.IGNORECASE
         )
         # 支持 [mm:ss], [mm:ss.xx], [mm:ss:xx]
         self.time_tag_pattern = re.compile(r'^\[\d{1,2}:\d{1,2}(?:[\.:]\d{1,3})?\]')

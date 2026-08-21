@@ -22,6 +22,44 @@ from ui.components.word_chip import WordChipRow
 from ui.commands.lrc_commands import WordTimestampCommand
 from ui.styles.theme_manager import theme_manager
 
+
+def parse_word_level_line(text: str, default_start: int) -> list:
+    """解析逐字歌词行为 token 列表。
+
+    约定与 core/lrc_aligner_v2._construct_line_string 一致：时间标签位于
+    字符之前，即 ``[t1]字1[t2]字2``。无标签的字符沿用 default_start。
+    """
+    parts = re.split(r'(\[\d{2}:\d{2}\.\d{2,3}\])', text)
+    tokens = []
+    current_time = default_start
+    for part in parts:
+        if not part:
+            continue
+        if re.match(r'^\[\d{2}:\d{2}\.\d{2,3}\]$', part):
+            current_time = parse_time_tag(part)
+        else:
+            for char in part:
+                tokens.append({'char': char, 'time': current_time, 'edited': False})
+    return tokens
+
+
+def build_word_level_line(tokens: list, base_time: int) -> tuple:
+    """将 token 列表组装为 (完整行, 内容列文本, 行首时间标签字符串)。
+
+    - 完整行: ``[t1]字1[t2]字2``（标签在字之前，与解析器/对齐器约定一致）
+    - 内容列文本: ``字1[t2]字2``（首字时间由表格「时间戳」列承载，避免重复行首标签）
+    """
+    segments = []
+    for idx, t in enumerate(tokens):
+        if idx > 0:
+            segments.append(f"[{format_ms(t['time'])}]")
+        segments.append(t['char'])
+    content = "".join(segments)
+
+    line_start_ms = tokens[0]['time'] if tokens else base_time
+    start_tag = f"[{format_ms(line_start_ms)}]"
+    return f"{start_tag}{content}", content, start_tag
+
 class WordLevelEditor(QDialog):
     """
     字级精细校对窗口 (Fluent 风格)
@@ -66,20 +104,7 @@ class WordLevelEditor(QDialog):
             self.player.setPosition(self.start_pos)
 
     def parse_line(self, text, default_start):
-        clean_text = re.sub(r'^\[\d{2}:\d{2}\.\d{2,3}\]', '', text)
-        parts = re.split(r'(\[\d{2}:\d{2}\.\d{2,3}\])', clean_text)
-        tokens = []
-        current_time = default_start
-        for part in parts:
-            if not part:
-                continue
-            if re.match(r'^\[\d{2}:\d{2}\.\d{2,3}\]$', part):
-                current_time = parse_time_tag(part)
-            else:
-                chars = list(part)
-                for char in chars:
-                    tokens.append({'char': char, 'time': current_time, 'edited': False})
-        return tokens
+        return parse_word_level_line(text, default_start)
 
     def setup_ui(self):
         layout = QVBoxLayout(self)
@@ -406,20 +431,22 @@ class WordLevelEditor(QDialog):
             super().keyPressEvent(event)
 
     def save_and_close(self):
-        # 组装逐字歌词文本
-        res = ""
-        for t in self.tokens:
-            res += f"{t['char']}[{format_ms(t['time'])}]"
-            
-        line_start_ms = self.tokens[0]['time'] if self.tokens else self.base_time
-        full_line = f"[{format_ms(line_start_ms)}]{res}"
-        
+        # 组装逐字歌词文本：时间标签置于字符之前（与解析器/对齐器约定一致），
+        # 首字时间由表格「时间戳」列承载，避免最终拼出行首双标签
+        full_line, content, start_tag = build_word_level_line(self.tokens, self.base_time)
+
         self.result_text = full_line
-        self.result_lrc_content = full_line
-        self.result_start_time = line_start_ms
-        self.player.stop()
+        self.result_lrc_content = content
+        self.result_start_time = start_tag
+        self._stop_playback()
         self.accept()
 
+    def _stop_playback(self):
+        """停止刷新定时器与播放器，避免对话框隐藏后 timer 空转"""
+        self.timer.stop()
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+            self.player.stop()
+
     def closeEvent(self, event):
-        self.player.stop()
+        self._stop_playback()
         super().closeEvent(event)
